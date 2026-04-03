@@ -57,6 +57,22 @@ export async function POST(req: NextRequest, { params }: { params: Promise<{ id:
       }
     }
 
+    // Save full squad to DB so users can start picking teams immediately
+    const { supabaseAdmin } = await import("@/lib/supabase")
+    await supabaseAdmin.from("match_players").delete().eq("match_id", id)
+    const { error: insertError } = await supabaseAdmin.from("match_players").insert(
+      players.map(p => ({
+        match_id: id,
+        cricketdata_player_id: p.cricketdata_player_id,
+        name: p.name,
+        team: p.team,
+        role: p.role,
+        is_playing: false,
+        fantasy_points: 0,
+      }))
+    )
+    if (insertError) return NextResponse.json({ error: insertError.message }, { status: 500 })
+
     return NextResponse.json({ success: true, players })
   } catch (err) {
     return NextResponse.json({ error: String(err) }, { status: 500 })

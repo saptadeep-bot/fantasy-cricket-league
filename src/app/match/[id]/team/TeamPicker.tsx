@@ -9,6 +9,7 @@ interface Player {
   team: string
   role: "BAT" | "BOWL" | "ALL" | "WK"
   fantasy_points: number
+  is_playing?: boolean
 }
 
 interface Match {
@@ -59,11 +60,14 @@ export default function TeamPicker({
   }, [selectedPlayers])
 
   const filteredPlayers = useMemo(() => {
-    if (filter === "team1") return players.filter(p => p.team === match.team1)
-    if (filter === "team2") return players.filter(p => p.team === match.team2)
-    if (filter === "ALL") return players
-    if (filter === "ALL_ROLE") return players.filter(p => p.role === "ALL")
-    return players.filter(p => p.role === filter)
+    let list: Player[]
+    if (filter === "team1") list = players.filter(p => p.team === match.team1)
+    else if (filter === "team2") list = players.filter(p => p.team === match.team2)
+    else if (filter === "ALL") list = players
+    else if (filter === "ALL_ROLE") list = players.filter(p => p.role === "ALL")
+    else list = players.filter(p => p.role === filter)
+    // Announced players shown first
+    return [...list].sort((a, b) => (b.is_playing ? 1 : 0) - (a.is_playing ? 1 : 0))
   }, [filter, players, match])
 
   function togglePlayer(playerId: string) {
@@ -221,6 +225,7 @@ export default function TeamPicker({
                     <span className="text-white text-sm font-medium truncate">{player.name}</span>
                     {isCaptain && <span className="text-xs bg-yellow-400 text-gray-900 px-1.5 py-0.5 rounded font-bold">C</span>}
                     {isVc && <span className="text-xs bg-gray-400 text-gray-900 px-1.5 py-0.5 rounded font-bold">VC</span>}
+                    {player.is_playing && <span className="text-xs bg-green-900 text-green-400 px-1.5 py-0.5 rounded font-medium">Playing</span>}
                   </div>
                   <div className="flex items-center gap-2 mt-0.5">
                     <span className={`text-xs px-1.5 py-0.5 rounded font-medium ${ROLE_COLORS[player.role]}`}>

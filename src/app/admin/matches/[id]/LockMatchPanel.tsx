@@ -8,6 +8,7 @@ interface Player {
   name: string
   team: string
   role: string
+  is_playing?: boolean
 }
 
 interface Match {
@@ -35,13 +36,15 @@ export default function LockMatchPanel({
 }) {
   const router = useRouter()
   const [squadPlayers, setSquadPlayers] = useState<Player[]>(existingPlayers)
+  // Pre-select announced players if squad was previously confirmed
   const [selectedXI, setSelectedXI] = useState<Set<string>>(
-    new Set(existingPlayers.filter(p => p.id).map(p => p.cricketdata_player_id))
+    new Set(existingPlayers.filter(p => p.is_playing).map(p => p.cricketdata_player_id))
   )
   const [loading, setLoading] = useState(false)
   const [locking, setLocking] = useState(false)
   const [closing, setClosing] = useState(false)
   const [message, setMessage] = useState<string | null>(null)
+  const [squadSaved, setSquadSaved] = useState(existingPlayers.length > 0)
 
   const alreadyLocked = match.status !== "upcoming"
 
@@ -53,8 +56,10 @@ export default function LockMatchPanel({
       const data = await res.json()
       if (data.success) {
         setSquadPlayers(data.players)
-        setSelectedXI(new Set())
-        setMessage(`Fetched ${data.players.length} players`)
+        // Preserve any existing is_playing selections
+        setSelectedXI(new Set(existingPlayers.filter(p => p.is_playing).map(p => p.cricketdata_player_id)))
+        setSquadSaved(true)
+        setMessage(`Saved ${data.players.length} players. Friends can now pick their teams!`)
       } else {
         setMessage(`Error: ${data.error}`)
       }
@@ -75,7 +80,7 @@ export default function LockMatchPanel({
     })
   }
 
-  // Validation — use dynamic team names from API data
+  // Validation
   const uniqueTeams = [...new Set(squadPlayers.map(p => p.team))].filter(Boolean)
   const selectedPlayers = squadPlayers.filter(p => selectedXI.has(p.cricketdata_player_id))
   const team1Players = selectedPlayers.filter(p => p.team === (uniqueTeams[0] || match.team1))
@@ -85,7 +90,7 @@ export default function LockMatchPanel({
     team2Players.length >= 11 && team2Players.length <= 15 &&
     team1Players.length + team2Players.length >= 22
 
-  async function confirmSquad() {
+  async function confirmAnnounced() {
     if (!isValidXI) return
     setLocking(true)
     setMessage(null)
@@ -97,7 +102,7 @@ export default function LockMatchPanel({
       })
       const data = await res.json()
       if (data.success) {
-        setMessage("Squad confirmed! Friends can now pick their teams.")
+        setMessage(`Announced players marked (${selectedXI.size}). Friends can edit their teams.`)
         router.refresh()
       } else {
         setMessage(`Error: ${data.error}`)
@@ -128,25 +133,25 @@ export default function LockMatchPanel({
     }
   }
 
-  // Group players by team name dynamically (don't rely on exact match with DB team names)
   const team1Squad = squadPlayers.filter(p => p.team === (uniqueTeams[0] || match.team1))
   const team2Squad = squadPlayers.filter(p => p.team === (uniqueTeams[1] || match.team2))
 
   return (
     <div className="space-y-4">
-      {/* Fetch squad button */}
+      {/* Fetch squad */}
       {!alreadyLocked && (
         <div className="bg-gray-900 border border-gray-800 rounded-2xl p-5">
-          <h3 className="font-semibold text-white mb-2">Step 1 — Fetch Squad</h3>
+          <h3 className="font-semibold text-white mb-1">Step 1 — Fetch Full Squad</h3>
           <p className="text-gray-500 text-sm mb-4">
-            After the toss, fetch squads and select announced players per team. Select 11–15 per team (minimum 22 total).
+            Fetch anytime — even days before the match. Friends can start picking teams immediately.
+            Re-fetch after toss to get any squad updates.
           </p>
           <button
             onClick={fetchSquad}
             disabled={loading}
             className="bg-yellow-400 text-gray-900 font-semibold px-4 py-2 rounded-xl text-sm hover:bg-yellow-300 transition disabled:opacity-50"
           >
-            {loading ? "Fetching..." : "Fetch Squad from API"}
+            {loading ? "Fetching..." : squadSaved ? "Re-fetch Squad" : "Fetch Squad from API"}
           </button>
           {message && <p className="mt-2 text-sm text-gray-300">{message}</p>}
         </div>
@@ -165,7 +170,7 @@ export default function LockMatchPanel({
                 <div className="flex items-center justify-between mb-3">
                   <h3 className="font-semibold text-white">{team}</h3>
                   <span className={`text-sm font-medium ${selectedCount >= 11 && selectedCount <= 15 ? "text-green-400" : "text-yellow-400"}`}>
-                    {selectedCount} selected (11–15)
+                    {selectedCount} announced (11–15)
                   </span>
                 </div>
                 <div className="space-y-2">
@@ -188,7 +193,7 @@ export default function LockMatchPanel({
                           </span>
                           <span>{player.name}</span>
                         </div>
-                        {isSelected && <span className="text-yellow-400 text-xs">✓</span>}
+                        {isSelected && <span className="text-yellow-400 text-xs">✓ announced</span>}
                       </button>
                     )
                   })}
@@ -197,36 +202,38 @@ export default function LockMatchPanel({
             )
           })}
 
-          {/* Confirm Squad button */}
+          {/* Mark announced players (after toss) */}
           {!alreadyLocked && (
             <div className="bg-gray-900 border border-gray-800 rounded-2xl p-5">
-              <h3 className="font-semibold text-white mb-2">Step 2 — Confirm Squad</h3>
-              <p className="text-gray-500 text-sm mb-1">
+              <h3 className="font-semibold text-white mb-1">Step 2 — Mark Announced Players (After Toss)</h3>
+              <p className="text-gray-500 text-sm mb-2">
+                Select 11–15 announced players per team. Friends will see which players are confirmed.
+              </p>
+              <p className="text-gray-500 text-sm mb-3">
                 {team1Players.length} from {uniqueTeams[0] || match.team1} · {team2Players.length} from {uniqueTeams[1] || match.team2}
               </p>
-              {!isValidXI && (
+              {!isValidXI && selectedXI.size > 0 && (
                 <p className="text-red-400 text-sm mb-3">
                   Select 11–15 per team, minimum 22 total.
                   ({team1Players.length} + {team2Players.length} = {team1Players.length + team2Players.length})
                 </p>
               )}
               <button
-                onClick={confirmSquad}
+                onClick={confirmAnnounced}
                 disabled={!isValidXI || locking}
                 className="bg-blue-500 text-white font-semibold px-4 py-2 rounded-xl text-sm hover:bg-blue-400 transition disabled:opacity-50 disabled:cursor-not-allowed"
               >
-                {locking ? "Confirming..." : "Confirm Squad & Open Team Selection"}
+                {locking ? "Saving..." : "Mark Announced Players"}
               </button>
-              {message && <p className="mt-2 text-sm text-gray-300">{message}</p>}
             </div>
           )}
 
-          {/* Lock Match button — only shown after squad is confirmed */}
-          {!alreadyLocked && existingPlayers.length > 0 && (
+          {/* Lock Match */}
+          {!alreadyLocked && squadSaved && (
             <div className="bg-gray-900 border border-orange-900 rounded-2xl p-5">
-              <h3 className="font-semibold text-white mb-2">Step 3 — Lock Match</h3>
+              <h3 className="font-semibold text-white mb-1">Step 3 — Lock Match</h3>
               <p className="text-gray-500 text-sm mb-3">
-                Close team selection before the match starts. Friends will no longer be able to edit their teams.
+                Close team selection right before the match starts.
               </p>
               <button
                 onClick={lockMatch}
@@ -240,7 +247,7 @@ export default function LockMatchPanel({
 
           {alreadyLocked && (
             <div className="bg-green-900/20 border border-green-800 rounded-2xl p-4 text-center">
-              <p className="text-green-400 font-medium">Match is {match.status} — Playing XI confirmed</p>
+              <p className="text-green-400 font-medium">Match is {match.status} — Team selection closed</p>
             </div>
           )}
         </>
