@@ -103,6 +103,14 @@ export function calculateFantasyPoints(scorecard: any[]): Map<string, PlayerFant
   }
 
   for (const inning of scorecard) {
+    // Build bowler name → {id, name} map for bowled/LBW bonus lookup
+    const bowlerByName = new Map<string, { id: string; name: string }>()
+    for (const entry of (inning.bowling || [])) {
+      const id = extractId(entry, 'bowler')
+      const name = extractName(entry, 'bowler')
+      if (id && name) bowlerByName.set(name.toLowerCase(), { id, name })
+    }
+
     // --- Batting ---
     for (const entry of (inning.batting || [])) {
       const id = extractId(entry, 'batsman')
@@ -120,6 +128,21 @@ export function calculateFantasyPoints(scorecard: any[]): Map<string, PlayerFant
       const p = getOrCreate(id, name)
       p.batting += pts
       p.total += pts
+
+      // Bowled/LBW bonus: +8 pts to the bowler
+      const lower = dismissalText.toLowerCase().trim()
+      const isBowled = lower.startsWith('b ') || lower === 'b'
+      const isLBW = lower.startsWith('lbw')
+      if (isBowled || isLBW) {
+        // Extract bowler name: "b Name" → "name", "lbw b Name" → "name"
+        const rawName = lower.replace(/^lbw\s+b\s+/, '').replace(/^b\s+/, '').trim()
+        const bowler = bowlerByName.get(rawName)
+        if (bowler) {
+          const bp = getOrCreate(bowler.id, bowler.name)
+          bp.bowling += 8
+          bp.total += 8
+        }
+      }
     }
 
     // --- Bowling ---
