@@ -1,0 +1,34 @@
+{
+  "permissions": {
+    "allow": [
+      "WebFetch(domain:www.cricketapi.com)",
+      "WebFetch(domain:cricketdata.org)",
+      "WebSearch",
+      "WebFetch(domain:www.my11circle.com)",
+      "WebFetch(domain:rapidapi.com)",
+      "WebFetch(domain:api.cricapi.com)",
+      "Bash(npx create-next-app@latest . --typescript --tailwind --eslint --app --src-dir --import-alias \"@/*\" --no-git --yes)",
+      "Read(//c/Users/Saptadeep Chatterjee/Desktop/**)",
+      "Bash(npx create-next-app@latest fantasy-cricket-temp --typescript --tailwind --eslint --app --src-dir --import-alias \"@/*\" --no-git --yes)",
+      "Bash(robocopy \"C:\\\\Users\\\\Saptadeep Chatterjee\\\\Desktop\\\\fantasy-cricket-temp\" \"C:\\\\Users\\\\Saptadeep Chatterjee\\\\Desktop\\\\FANTASY CRICKET LEAGUE\" /E /XD node_modules /NFL /NDL /NJH /NJS)",
+      "Bash(cp \"C:/Users/Saptadeep Chatterjee/Desktop/fantasy-cricket-temp/package.json\" \"C:/Users/Saptadeep Chatterjee/Desktop/FANTASY CRICKET LEAGUE/package.json\")",
+      "Bash(cp \"C:/Users/Saptadeep Chatterjee/Desktop/fantasy-cricket-temp/tsconfig.json\" \"C:/Users/Saptadeep Chatterjee/Desktop/FANTASY CRICKET LEAGUE/tsconfig.json\")",
+      "Bash(cp \"C:/Users/Saptadeep Chatterjee/Desktop/fantasy-cricket-temp/next.config.ts\" \"C:/Users/Saptadeep Chatterjee/Desktop/FANTASY CRICKET LEAGUE/next.config.ts\")",
+      "Bash(cp \"C:/Users/Saptadeep Chatterjee/Desktop/fantasy-cricket-temp/postcss.config.mjs\" \"C:/Users/Saptadeep Chatterjee/Desktop/FANTASY CRICKET LEAGUE/postcss.config.mjs\")",
+      "Bash(cp \"C:/Users/Saptadeep Chatterjee/Desktop/fantasy-cricket-temp/eslint.config.mjs\" \"C:/Users/Saptadeep Chatterjee/Desktop/FANTASY CRICKET LEAGUE/eslint.config.mjs\")",
+      "Bash(cp -r \"C:/Users/Saptadeep Chatterjee/Desktop/fantasy-cricket-temp/src\" \"C:/Users/Saptadeep Chatterjee/Desktop/FANTASY CRICKET LEAGUE/src\")",
+      "Bash(cp -r \"C:/Users/Saptadeep Chatterjee/Desktop/fantasy-cricket-temp/public\" \"C:/Users/Saptadeep Chatterjee/Desktop/FANTASY CRICKET LEAGUE/public\")",
+      "Bash(npm install:*)",
+      "Bash(npm run:*)",
+      "Bash(mkdir -p \"C:/Users/Saptadeep Chatterjee/Desktop/FANTASY CRICKET LEAGUE/src/app/admin/matches/[id]\")",
+      "Bash(mkdir -p \"C:/Users/Saptadeep Chatterjee/Desktop/FANTASY CRICKET LEAGUE/src/app/api/admin/matches/[id]/fetch-squad\")",
+      "Bash(mkdir -p \"C:/Users/Saptadeep Chatterjee/Desktop/FANTASY CRICKET LEAGUE/src/app/api/admin/matches/[id]/lock\")",
+      "Bash(mkdir -p \"C:/Users/Saptadeep Chatterjee/Desktop/FANTASY CRICKET LEAGUE/src/app/api/match/[id]/team\")",
+      "Bash(mkdir -p \"C:/Users/Saptadeep Chatterjee/Desktop/FANTASY CRICKET LEAGUE/src/app/match/[id]/team\")",
+      "Bash(mkdir -p \"/c/Users/Saptadeep Chatterjee/Desktop/FANTASY CRICKET LEAGUE/src/app/api/admin/matches/[id]/scores\")",
+      "Bash(mkdir -p \"/c/Users/Saptadeep Chatterjee/Desktop/FANTASY CRICKET LEAGUE/src/app/api/admin/matches/[id]/finalize\")",
+      "Bash(mkdir -p \"/c/Users/Saptadeep Chatterjee/Desktop/FANTASY CRICKET LEAGUE/src/app/api/admin/matches/[id]/status\")",
+      "Bash(mkdir -p \"/c/Users/Saptadeep Chatterjee/Desktop/FANTASY CRICKET LEAGUE/src/app/match/[id]\")"
+    ]
+  }
+}
