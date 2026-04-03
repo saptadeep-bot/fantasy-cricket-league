@@ -253,7 +253,7 @@ export default function LiveMatchView({
           ) : (
             <div className="text-center py-8">
               <p className="text-gray-500">You haven&apos;t submitted a team for this match.</p>
-              {match.status === "locked" && (
+              {match.status === "upcoming" && (
                 <a href={`/match/${match.id}/team`} className="mt-3 inline-block bg-yellow-400 text-gray-900 font-semibold px-4 py-2 rounded-xl text-sm">
                   Pick Team →
                 </a>

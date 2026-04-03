@@ -18,7 +18,7 @@ export default async function TeamSelectionPage({ params }: { params: Promise<{ 
   if (!match) redirect("/")
 
   // Check if team selection is allowed
-  if (!["upcoming", "locked"].includes(match.status)) {
+  if (match.status !== "upcoming") {
     redirect(`/match/${id}`)
   }
 

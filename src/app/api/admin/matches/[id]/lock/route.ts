@@ -77,14 +77,7 @@ export async function POST(req: NextRequest, { params }: { params: Promise<{ id:
 
     if (insertError) return NextResponse.json({ error: insertError.message }, { status: 500 })
 
-    // Lock the match
-    const { error: updateError } = await supabaseAdmin
-      .from("matches")
-      .update({ status: "locked", locked_at: new Date().toISOString() })
-      .eq("id", id)
-
-    if (updateError) return NextResponse.json({ error: updateError.message }, { status: 500 })
-
+    // Keep status as upcoming — team selection is now open
     return NextResponse.json({ success: true })
   } catch (err) {
     return NextResponse.json({ error: String(err) }, { status: 500 })

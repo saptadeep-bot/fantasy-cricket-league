@@ -49,7 +49,7 @@ export async function POST(req: NextRequest, { params }: { params: Promise<{ id:
     .single()
 
   if (!match) return NextResponse.json({ error: "Match not found" }, { status: 404 })
-  if (!["locked", "upcoming"].includes(match.status)) {
+  if (match.status !== "upcoming") {
     return NextResponse.json({ error: "Team selection is closed for this match" }, { status: 400 })
   }
 

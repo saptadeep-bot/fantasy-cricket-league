@@ -40,6 +40,7 @@ export default function LockMatchPanel({
   )
   const [loading, setLoading] = useState(false)
   const [locking, setLocking] = useState(false)
+  const [closing, setClosing] = useState(false)
   const [message, setMessage] = useState<string | null>(null)
 
   const alreadyLocked = match.status !== "upcoming"
@@ -84,7 +85,7 @@ export default function LockMatchPanel({
     team2Players.length >= 11 && team2Players.length <= 15 &&
     team1Players.length + team2Players.length >= 22
 
-  async function lockMatch() {
+  async function confirmSquad() {
     if (!isValidXI) return
     setLocking(true)
     setMessage(null)
@@ -96,7 +97,7 @@ export default function LockMatchPanel({
       })
       const data = await res.json()
       if (data.success) {
-        setMessage("Match locked! Team selection is now open.")
+        setMessage("Squad confirmed! Friends can now pick their teams.")
         router.refresh()
       } else {
         setMessage(`Error: ${data.error}`)
@@ -105,6 +106,25 @@ export default function LockMatchPanel({
       setMessage("Network error")
     } finally {
       setLocking(false)
+    }
+  }
+
+  async function lockMatch() {
+    setClosing(true)
+    setMessage(null)
+    try {
+      const res = await fetch(`/api/admin/matches/${match.id}/close`, { method: "POST" })
+      const data = await res.json()
+      if (data.success) {
+        setMessage("Match locked. Team selection is now closed.")
+        router.refresh()
+      } else {
+        setMessage(`Error: ${data.error}`)
+      }
+    } catch {
+      setMessage("Network error")
+    } finally {
+      setClosing(false)
     }
   }
 
@@ -177,12 +197,12 @@ export default function LockMatchPanel({
             )
           })}
 
-          {/* Lock button */}
+          {/* Confirm Squad button */}
           {!alreadyLocked && (
             <div className="bg-gray-900 border border-gray-800 rounded-2xl p-5">
-              <h3 className="font-semibold text-white mb-2">Step 2 — Lock Match</h3>
+              <h3 className="font-semibold text-white mb-2">Step 2 — Confirm Squad</h3>
               <p className="text-gray-500 text-sm mb-1">
-                {team1Players.length}/11 from {uniqueTeams[0] || match.team1} · {team2Players.length}/11 from {uniqueTeams[1] || match.team2}
+                {team1Players.length} from {uniqueTeams[0] || match.team1} · {team2Players.length} from {uniqueTeams[1] || match.team2}
               </p>
               {!isValidXI && (
                 <p className="text-red-400 text-sm mb-3">
@@ -191,13 +211,30 @@ export default function LockMatchPanel({
                 </p>
               )}
               <button
-                onClick={lockMatch}
+                onClick={confirmSquad}
                 disabled={!isValidXI || locking}
                 className="bg-blue-500 text-white font-semibold px-4 py-2 rounded-xl text-sm hover:bg-blue-400 transition disabled:opacity-50 disabled:cursor-not-allowed"
               >
-                {locking ? "Locking..." : "Lock Match & Open Team Selection"}
+                {locking ? "Confirming..." : "Confirm Squad & Open Team Selection"}
               </button>
               {message && <p className="mt-2 text-sm text-gray-300">{message}</p>}
+            </div>
+          )}
+
+          {/* Lock Match button — only shown after squad is confirmed */}
+          {!alreadyLocked && existingPlayers.length > 0 && (
+            <div className="bg-gray-900 border border-orange-900 rounded-2xl p-5">
+              <h3 className="font-semibold text-white mb-2">Step 3 — Lock Match</h3>
+              <p className="text-gray-500 text-sm mb-3">
+                Close team selection before the match starts. Friends will no longer be able to edit their teams.
+              </p>
+              <button
+                onClick={lockMatch}
+                disabled={closing}
+                className="bg-orange-500 text-white font-semibold px-4 py-2 rounded-xl text-sm hover:bg-orange-400 transition disabled:opacity-50 disabled:cursor-not-allowed"
+              >
+                {closing ? "Locking..." : "Lock Match (Close Team Selection)"}
+              </button>
             </div>
           )}
 
