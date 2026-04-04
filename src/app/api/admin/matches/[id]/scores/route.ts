@@ -100,10 +100,26 @@ export async function GET(req: NextRequest, { params }: { params: Promise<{ id: 
     }
 
     if (shouldFetch) {
-      try {
-        await fetchAndSaveScores(id, match.cricketdata_match_id)
-      } catch {
-        // Silently fail — return whatever is in DB
+      if (force) {
+        // For manual refresh — surface errors so the client knows what went wrong
+        try {
+          const result = await fetchAndSaveScores(id, match.cricketdata_match_id)
+          const { data: players } = await supabaseAdmin
+            .from("match_players")
+            .select("cricketdata_player_id, name, team, role, fantasy_points, last_updated")
+            .eq("match_id", id)
+            .order("fantasy_points", { ascending: false })
+          return NextResponse.json({ players: players || [], ...result })
+        } catch (err) {
+          return NextResponse.json({ error: String(err) }, { status: 400 })
+        }
+      } else {
+        // Auto-poll — silently fail, return DB data
+        try {
+          await fetchAndSaveScores(id, match.cricketdata_match_id)
+        } catch {
+          // Silently fail
+        }
       }
     }
   }

@@ -86,6 +86,7 @@ export default function LiveMatchView({
     .sort((a, b) => b.liveScore - a.liveScore)
 
   const [refreshing, setRefreshing] = useState(false)
+  const [refreshError, setRefreshError] = useState<string | null>(null)
 
   // Auto-poll (uses stale check on server — won't hammer API)
   const fetchLiveScores = useCallback(async () => {
@@ -101,18 +102,21 @@ export default function LiveMatchView({
     }
   }, [match.id])
 
-  // Manual refresh — always fetches fresh from API
+  // Manual refresh — always fetches fresh from API, surfaces errors
   const manualRefresh = useCallback(async () => {
     setRefreshing(true)
+    setRefreshError(null)
     try {
       const res = await fetch(`/api/admin/matches/${match.id}/scores?force=true`)
       const data = await res.json()
-      if (data.players) {
+      if (data.error) {
+        setRefreshError(data.error)
+      } else if (data.players) {
         setLivePlayers(data.players)
         setLastUpdated(new Date())
       }
     } catch {
-      // Silently fail
+      setRefreshError("Network error. Try again.")
     } finally {
       setRefreshing(false)
     }
@@ -193,19 +197,24 @@ export default function LiveMatchView({
                   {match.status === "live" ? "Live Leaderboard" : "Leaderboard"}
                 </h2>
                 {match.status === "live" && (
-                  <div className="flex items-center gap-2">
-                    {lastUpdated && (
-                      <span className="text-gray-600 text-xs">
-                        {lastUpdated.toLocaleTimeString("en-IN", { timeStyle: "short" })}
-                      </span>
+                  <div className="text-right">
+                    <div className="flex items-center gap-2">
+                      {lastUpdated && (
+                        <span className="text-gray-600 text-xs">
+                          {lastUpdated.toLocaleTimeString("en-IN", { timeStyle: "short" })}
+                        </span>
+                      )}
+                      <button
+                        onClick={manualRefresh}
+                        disabled={refreshing}
+                        className="bg-yellow-400/10 border border-yellow-400/40 text-yellow-400 text-xs font-semibold px-3 py-1 rounded-lg hover:bg-yellow-400/20 transition disabled:opacity-50"
+                      >
+                        {refreshing ? "Fetching..." : "↻ Refresh"}
+                      </button>
+                    </div>
+                    {refreshError && (
+                      <p className="text-red-400 text-xs mt-1">{refreshError}</p>
                     )}
-                    <button
-                      onClick={manualRefresh}
-                      disabled={refreshing}
-                      className="bg-yellow-400/10 border border-yellow-400/40 text-yellow-400 text-xs font-semibold px-3 py-1 rounded-lg hover:bg-yellow-400/20 transition disabled:opacity-50"
-                    >
-                      {refreshing ? "..." : "↻ Refresh"}
-                    </button>
                   </div>
                 )}
               </div>
