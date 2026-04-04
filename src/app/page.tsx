@@ -17,12 +17,23 @@ export default async function HomePage() {
 
   const nextMatch = upcomingMatches?.[0] ?? null
 
-  // Check if current user has a team for the next match
+  const secondMatch = upcomingMatches?.[1] ?? null
+
+  // Check if current user has a team for the next two matches
   const { data: myNextTeam } = nextMatch
     ? await supabaseAdmin
         .from("teams")
         .select("id")
         .eq("match_id", nextMatch.id)
+        .eq("user_id", session.user.id)
+        .maybeSingle()
+    : { data: null }
+
+  const { data: mySecondTeam } = secondMatch
+    ? await supabaseAdmin
+        .from("teams")
+        .select("id")
+        .eq("match_id", secondMatch.id)
         .eq("user_id", session.user.id)
         .maybeSingle()
     : { data: null }
@@ -122,22 +133,34 @@ export default async function HomePage() {
           <div className="bg-gray-900 rounded-2xl p-5 border border-gray-800">
             <h2 className="text-sm font-semibold text-gray-400 uppercase tracking-wider mb-3">Coming Up</h2>
             <div className="space-y-3">
-              {upcomingMatches.slice(1).map(m => (
-                <div key={m.id} className="flex items-center justify-between">
-                  <div>
-                    <p className="text-white text-sm font-medium">{m.team1} vs {m.team2}</p>
-                    <p className="text-gray-500 text-xs">
-                      {new Date(m.scheduled_at).toLocaleString("en-IN", {
-                        dateStyle: "medium", timeStyle: "short", timeZone: "Asia/Kolkata"
-                      })}
-                    </p>
+              {upcomingMatches.slice(1).map((m, idx) => {
+                const isSecond = idx === 0
+                const hasTeam = isSecond ? !!mySecondTeam : false
+                const canPick = isSecond && m.status === "upcoming"
+                return (
+                  <div key={m.id} className={`flex items-center justify-between ${isSecond ? "pb-3 border-b border-gray-800" : ""}`}>
+                    <div>
+                      <p className="text-white text-sm font-medium">{m.team1} vs {m.team2}</p>
+                      <p className="text-gray-500 text-xs">
+                        {new Date(m.scheduled_at).toLocaleString("en-IN", {
+                          dateStyle: "medium", timeStyle: "short", timeZone: "Asia/Kolkata"
+                        })}
+                      </p>
+                      <p className="text-gray-600 text-xs">M{m.match_number} · ₹{m.base_prize + (m.rollover_added || 0)}</p>
+                    </div>
+                    {canPick ? (
+                      <a
+                        href={`/match/${m.id}/team`}
+                        className="bg-yellow-400/10 border border-yellow-400/40 text-yellow-400 text-xs font-semibold px-3 py-1.5 rounded-xl hover:bg-yellow-400/20 transition whitespace-nowrap"
+                      >
+                        {hasTeam ? "Edit →" : "Pick →"}
+                      </a>
+                    ) : (
+                      <p className="text-yellow-400 text-xs font-semibold">₹{m.base_prize + (m.rollover_added || 0)}</p>
+                    )}
                   </div>
-                  <div className="text-right">
-                    <p className="text-yellow-400 text-xs font-semibold">₹{m.base_prize + (m.rollover_added || 0)}</p>
-                    <p className="text-gray-600 text-xs">M{m.match_number}</p>
-                  </div>
-                </div>
-              ))}
+                )
+              })}
             </div>
           </div>
         )}

@@ -75,21 +75,28 @@ export async function GET(req: NextRequest, { params }: { params: Promise<{ id: 
     .eq("id", id)
     .single()
 
-  // Auto-refresh if live and stale
+  // Fetch fresh scores if: forced (manual refresh button) OR auto-refresh when stale >9 min
+  const force = req.nextUrl.searchParams.get("force") === "true"
+
   if (match?.status === "live" && match.cricketdata_match_id) {
-    const { data: lastPlayer } = await supabaseAdmin
-      .from("match_players")
-      .select("last_updated")
-      .eq("match_id", id)
-      .order("last_updated", { ascending: false })
-      .limit(1)
-      .single()
+    let shouldFetch = force
 
-    const lastUpdated = lastPlayer?.last_updated ? new Date(lastPlayer.last_updated) : null
-    const nineMinutesAgo = new Date(Date.now() - 9 * 60 * 1000)
-    const isStale = !lastUpdated || lastUpdated < nineMinutesAgo
+    if (!shouldFetch) {
+      // Auto-refresh: only fetch if data is stale (>9 min)
+      const { data: lastPlayer } = await supabaseAdmin
+        .from("match_players")
+        .select("last_updated")
+        .eq("match_id", id)
+        .order("last_updated", { ascending: false })
+        .limit(1)
+        .single()
 
-    if (isStale) {
+      const lastUpdated = lastPlayer?.last_updated ? new Date(lastPlayer.last_updated) : null
+      const nineMinutesAgo = new Date(Date.now() - 9 * 60 * 1000)
+      shouldFetch = !lastUpdated || lastUpdated < nineMinutesAgo
+    }
+
+    if (shouldFetch) {
       try {
         await fetchAndSaveScores(id, match.cricketdata_match_id)
       } catch {

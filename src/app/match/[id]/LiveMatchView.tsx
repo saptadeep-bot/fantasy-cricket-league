@@ -85,7 +85,9 @@ export default function LiveMatchView({
     .map(t => ({ ...t, liveScore: Math.round(computeTeamScore(t) * 10) / 10 }))
     .sort((a, b) => b.liveScore - a.liveScore)
 
-  // Poll for live updates every 2 minutes when match is live
+  const [refreshing, setRefreshing] = useState(false)
+
+  // Auto-poll (uses stale check on server — won't hammer API)
   const fetchLiveScores = useCallback(async () => {
     try {
       const res = await fetch(`/api/admin/matches/${match.id}/scores`)
@@ -96,6 +98,23 @@ export default function LiveMatchView({
       }
     } catch {
       // Silently fail on polling errors
+    }
+  }, [match.id])
+
+  // Manual refresh — always fetches fresh from API
+  const manualRefresh = useCallback(async () => {
+    setRefreshing(true)
+    try {
+      const res = await fetch(`/api/admin/matches/${match.id}/scores?force=true`)
+      const data = await res.json()
+      if (data.players) {
+        setLivePlayers(data.players)
+        setLastUpdated(new Date())
+      }
+    } catch {
+      // Silently fail
+    } finally {
+      setRefreshing(false)
     }
   }, [match.id])
 
@@ -181,10 +200,11 @@ export default function LiveMatchView({
                       </span>
                     )}
                     <button
-                      onClick={fetchLiveScores}
-                      className="bg-yellow-400/10 border border-yellow-400/40 text-yellow-400 text-xs font-semibold px-3 py-1 rounded-lg hover:bg-yellow-400/20 transition"
+                      onClick={manualRefresh}
+                      disabled={refreshing}
+                      className="bg-yellow-400/10 border border-yellow-400/40 text-yellow-400 text-xs font-semibold px-3 py-1 rounded-lg hover:bg-yellow-400/20 transition disabled:opacity-50"
                     >
-                      ↻ Refresh
+                      {refreshing ? "..." : "↻ Refresh"}
                     </button>
                   </div>
                 )}
