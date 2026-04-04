@@ -125,7 +125,7 @@ export default function LiveMatchView({
   useEffect(() => {
     if (match.status === "live") {
       fetchLiveScores()
-      const interval = setInterval(fetchLiveScores, 10 * 60 * 1000) // every 10 min
+      const interval = setInterval(fetchLiveScores, 4 * 60 * 1000) // every 4 min
       return () => clearInterval(interval)
     }
   }, [match.status, fetchLiveScores])

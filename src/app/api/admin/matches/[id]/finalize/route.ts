@@ -28,7 +28,20 @@ export async function POST(req: NextRequest, { params }: { params: Promise<{ id:
     )
     const data = await res.json()
 
+    if (data.status !== "success") {
+      return NextResponse.json({ error: `Scorecard API error: ${data.message || JSON.stringify(data)}` }, { status: 500 })
+    }
+
     const scorecard = data.data?.scorecard || []
+
+    // Hard stop — must have both innings before finalizing
+    if (scorecard.length === 0) {
+      return NextResponse.json({ error: "No scorecard data returned from API. Match may not have ended yet. Try again in a minute." }, { status: 400 })
+    }
+    if (scorecard.length < 2) {
+      return NextResponse.json({ error: `Only ${scorecard.length} innings found in scorecard. Both innings must be complete before finalizing.` }, { status: 400 })
+    }
+
     const fantasyPointsMap = calculateFantasyPoints(scorecard)
 
     // Build points lookup map and update match_players

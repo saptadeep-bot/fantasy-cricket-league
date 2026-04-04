@@ -95,8 +95,8 @@ export async function GET(req: NextRequest, { params }: { params: Promise<{ id: 
         .single()
 
       const lastUpdated = lastPlayer?.last_updated ? new Date(lastPlayer.last_updated) : null
-      const nineMinutesAgo = new Date(Date.now() - 9 * 60 * 1000)
-      shouldFetch = !lastUpdated || lastUpdated < nineMinutesAgo
+      const threeMinutesAgo = new Date(Date.now() - 3 * 60 * 1000)
+      shouldFetch = !lastUpdated || lastUpdated < threeMinutesAgo
     }
 
     if (shouldFetch) {
