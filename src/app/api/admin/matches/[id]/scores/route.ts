@@ -75,14 +75,17 @@ export async function GET(req: NextRequest, { params }: { params: Promise<{ id: 
     .eq("id", id)
     .single()
 
-  // Fetch fresh scores if: forced (manual refresh button) OR auto-refresh when stale >9 min
-  const force = req.nextUrl.searchParams.get("force") === "true"
+  const url = new URL(req.url)
+  const force = url.searchParams.get("force") === "true"
 
-  if (match?.status === "live" && match.cricketdata_match_id) {
-    let shouldFetch = force
+  if (match?.cricketdata_match_id) {
+    let shouldFetch = false
 
-    if (!shouldFetch) {
-      // Auto-refresh: only fetch if data is stale (>9 min)
+    if (force) {
+      // Manual refresh: always fetch regardless of match status
+      shouldFetch = true
+    } else if (match.status === "live") {
+      // Auto-poll: only fetch if data is stale (>9 min)
       const { data: lastPlayer } = await supabaseAdmin
         .from("match_players")
         .select("last_updated")
