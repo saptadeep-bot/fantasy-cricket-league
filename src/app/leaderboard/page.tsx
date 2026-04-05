@@ -98,36 +98,47 @@ export default async function LeaderboardPage() {
           </div>
         )}
 
-        {/* Stats grid */}
+        {/* Stats cards */}
         {stats.some(s => s.matchesPlayed > 0) && (
-          <div className="bg-gray-900 border border-gray-800 rounded-2xl p-4">
-            <h2 className="text-white font-semibold mb-3">Season Stats</h2>
-            <div className="overflow-x-auto">
-              <table className="w-full text-sm">
-                <thead>
-                  <tr className="text-gray-500 text-xs uppercase">
-                    <th className="text-left pb-2">Player</th>
-                    <th className="text-right pb-2">Played</th>
-                    <th className="text-right pb-2">Pts</th>
-                    <th className="text-right pb-2">1st</th>
-                    <th className="text-right pb-2">2nd</th>
-                    <th className="text-right pb-2">Won</th>
-                  </tr>
-                </thead>
-                <tbody className="divide-y divide-gray-800">
-                  {stats.map(player => (
-                    <tr key={player.id} className={player.id === currentUserId ? "text-yellow-400" : "text-gray-300"}>
-                      <td className="py-2 font-medium">{player.name}</td>
-                      <td className="py-2 text-right text-gray-500">{player.matchesPlayed}</td>
-                      <td className="py-2 text-right font-semibold">{player.totalPoints}</td>
-                      <td className="py-2 text-right">{player.firstPlaceWins}</td>
-                      <td className="py-2 text-right">{player.secondPlaceWins}</td>
-                      <td className="py-2 text-right">₹{player.totalPrizeWon}</td>
-                    </tr>
-                  ))}
-                </tbody>
-              </table>
-            </div>
+          <div className="space-y-2">
+            <h2 className="text-white font-semibold px-1">Season Stats</h2>
+            {stats.map((player, idx) => {
+              const isMe = player.id === currentUserId
+              return (
+                <div key={player.id} className={`bg-gray-900 border rounded-2xl p-4 ${isMe ? "border-yellow-400/50" : "border-gray-800"}`}>
+                  {/* Player name row */}
+                  <div className="flex items-center justify-between mb-3">
+                    <div className="flex items-center gap-2">
+                      <span className="text-gray-600 text-xs font-bold w-5">#{idx + 1}</span>
+                      <p className={`font-semibold text-sm ${isMe ? "text-yellow-400" : "text-white"}`}>
+                        {player.name.split(" ")[0]}
+                        {isMe && <span className="text-xs text-yellow-500 ml-1">(You)</span>}
+                      </p>
+                    </div>
+                    <p className="text-white font-bold">{player.totalPoints} pts</p>
+                  </div>
+                  {/* Stats row */}
+                  <div className="grid grid-cols-4 gap-2">
+                    <div className="bg-gray-800 rounded-xl p-2 text-center">
+                      <p className="text-gray-500 text-xs mb-0.5">Played</p>
+                      <p className="text-white font-semibold text-sm">{player.matchesPlayed}</p>
+                    </div>
+                    <div className="bg-gray-800 rounded-xl p-2 text-center">
+                      <p className="text-gray-500 text-xs mb-0.5">🥇 Wins</p>
+                      <p className="text-yellow-400 font-semibold text-sm">{player.firstPlaceWins}</p>
+                    </div>
+                    <div className="bg-gray-800 rounded-xl p-2 text-center">
+                      <p className="text-gray-500 text-xs mb-0.5">🥈 Wins</p>
+                      <p className="text-gray-300 font-semibold text-sm">{player.secondPlaceWins}</p>
+                    </div>
+                    <div className="bg-gray-800 rounded-xl p-2 text-center">
+                      <p className="text-gray-500 text-xs mb-0.5">Earned</p>
+                      <p className="text-green-400 font-semibold text-sm">₹{player.totalPrizeWon}</p>
+                    </div>
+                  </div>
+                </div>
+              )
+            })}
           </div>
         )}
       </main>

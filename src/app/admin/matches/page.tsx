@@ -12,6 +12,7 @@ export default async function AdminMatchesPage() {
   const { data: matches } = await supabaseAdmin
     .from("matches")
     .select("*")
+    .not("status", "eq", "completed")
     .order("scheduled_at", { ascending: true })
 
   return (
