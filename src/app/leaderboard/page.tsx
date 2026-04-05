@@ -26,13 +26,6 @@ export default async function LeaderboardPage() {
     .from("match_results")
     .select("user_id, rank, final_points, prize_won, matches(match_type)")
 
-  // Fetch total season reserve
-  const { data: reserve } = await supabaseAdmin
-    .from("season_reserve")
-    .select("amount")
-
-  const totalReserve = reserve?.reduce((sum, r) => sum + (r.amount || 0), 0) || 0
-
   // Compute per-user stats
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   const stats = (users || []).map(user => {
@@ -73,15 +66,6 @@ export default async function LeaderboardPage() {
       <Navbar />
       <main className="max-w-2xl mx-auto px-4 py-6 space-y-5">
         <h1 className="text-xl font-bold text-white">Season Leaderboard</h1>
-
-        {/* Season reserve banner */}
-        <div className="bg-gradient-to-r from-yellow-900/40 to-yellow-800/20 border border-yellow-700/40 rounded-2xl p-4 flex items-center justify-between">
-          <div>
-            <p className="text-yellow-400 font-semibold">Season Reserve Pot 🏆</p>
-            <p className="text-gray-400 text-xs mt-0.5">Awarded to top 2 at end of IPL 2026</p>
-          </div>
-          <p className="text-yellow-400 font-bold text-2xl">₹{totalReserve}</p>
-        </div>
 
         {/* Leaderboard table */}
         {stats.length === 0 || stats.every(s => s.matchesPlayed === 0) ? (

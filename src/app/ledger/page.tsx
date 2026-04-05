@@ -15,26 +15,31 @@ export default async function LedgerPage() {
   // Fetch all results with match info
   const { data: results } = await supabaseAdmin
     .from("match_results")
-    .select("*, matches(name, match_number, scheduled_at), users(name)")
+    .select("*, matches(name, match_number, scheduled_at, match_type), users(name)")
     .order("created_at", { ascending: false })
 
-  // Fetch season reserve
-  const { data: reserve } = await supabaseAdmin.from("season_reserve").select("amount")
-  const totalReserve = reserve?.reduce((sum, r) => sum + (r.amount || 0), 0) || 0
+  function getEntryFee(matchType: string): number {
+    const type = (matchType || "league").toLowerCase()
+    if (type === "final") return 500
+    if (type === "eliminator" || type === "qualifier" || type.includes("qualifier") || type.includes("eliminator")) return 350
+    return 250
+  }
 
-  // Compute net balance per user
-  // Each user contributed ₹2500 to pool. Net = prize_won_total - contribution
-  // Contribution = ₹2500 flat (they all paid upfront)
-  const CONTRIBUTION_PER_PERSON = 2500
-
+  // Compute net balance per user based on per-match entry fees
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
   const balances = (users || []).map(user => {
-    const userResults = (results || []).filter(r => r.user_id === user.id)
-    const totalWon = userResults.reduce((s, r) => s + (r.prize_won || 0), 0)
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const userResults = (results || []).filter((r: any) => r.user_id === user.id)
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const totalWon = userResults.reduce((s: number, r: any) => s + (r.prize_won || 0), 0)
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const totalInvested = userResults.reduce((s: number, r: any) => s + getEntryFee(r.matches?.match_type || "league"), 0)
     return {
       id: user.id,
       name: user.name,
-      totalWon: Math.round(totalWon * 100) / 100,
-      netBalance: Math.round((totalWon - CONTRIBUTION_PER_PERSON) * 100) / 100,
+      totalWon: Math.round(totalWon),
+      totalInvested,
+      netBalance: Math.round(totalWon - totalInvested),
     }
   }).sort((a, b) => b.netBalance - a.netBalance)
 
@@ -61,14 +66,10 @@ export default async function LedgerPage() {
                   <p className={`font-bold ${player.netBalance > 0 ? "text-green-400" : player.netBalance < 0 ? "text-red-400" : "text-gray-400"}`}>
                     {player.netBalance > 0 ? "+" : ""}₹{player.netBalance}
                   </p>
-                  <p className="text-gray-600 text-xs">₹{player.totalWon} won of ₹{CONTRIBUTION_PER_PERSON} paid</p>
+                  <p className="text-gray-600 text-xs">₹{player.totalWon} won · ₹{player.totalInvested} invested</p>
                 </div>
               </div>
             ))}
-          </div>
-          <div className="mt-4 pt-3 border-t border-gray-800 flex items-center justify-between">
-            <span className="text-gray-500 text-sm">Season Reserve</span>
-            <span className="text-yellow-400 font-semibold">₹{totalReserve}</span>
           </div>
         </div>
 

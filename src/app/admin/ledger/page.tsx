@@ -17,9 +17,6 @@ export default async function AdminLedgerPage() {
     .gt("prize_won", 0)
     .order("created_at", { ascending: false })
 
-  const { data: reserve } = await supabaseAdmin.from("season_reserve").select("amount, reason, created_at, matches(name)")
-  const totalReserve = reserve?.reduce((sum, r) => sum + (r.amount || 0), 0) || 0
-
   const pending = results?.filter(r => !r.is_settled) || []
   const settled = results?.filter(r => r.is_settled) || []
 
@@ -30,12 +27,6 @@ export default async function AdminLedgerPage() {
         <div className="flex items-center justify-between">
           <h1 className="text-xl font-bold text-white">Admin · Payout Ledger</h1>
           <a href="/admin" className="text-gray-500 text-sm hover:text-white">← Back</a>
-        </div>
-
-        {/* Reserve */}
-        <div className="bg-yellow-900/20 border border-yellow-800/50 rounded-2xl p-4 flex items-center justify-between">
-          <p className="text-yellow-400 font-medium">Season Reserve Pot</p>
-          <p className="text-yellow-400 font-bold text-xl">₹{totalReserve}</p>
         </div>
 
         {/* Pending settlements */}
@@ -84,21 +75,6 @@ export default async function AdminLedgerPage() {
           </div>
         )}
 
-        {/* Reserve log */}
-        {reserve && reserve.length > 0 && (
-          <div className="bg-gray-900 border border-gray-800 rounded-2xl p-5">
-            <h2 className="text-white font-semibold mb-3">Reserve Log</h2>
-            <div className="space-y-2">
-              {/* eslint-disable-next-line @typescript-eslint/no-explicit-any */}
-              {reserve.map((r: any, i: number) => (
-                <div key={i} className="flex items-center justify-between text-sm">
-                  <p className="text-gray-400">{r.matches?.name || "Opening balance"} · <span className="text-gray-600">{r.reason}</span></p>
-                  <span className="text-yellow-400">+₹{r.amount}</span>
-                </div>
-              ))}
-            </div>
-          </div>
-        )}
       </main>
     </div>
   )
