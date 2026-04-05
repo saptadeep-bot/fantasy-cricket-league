@@ -3,6 +3,8 @@ import { redirect } from "next/navigation"
 import Navbar from "@/components/Navbar"
 import { supabaseAdmin } from "@/lib/supabase"
 
+export const dynamic = "force-dynamic"
+
 export default async function HomePage() {
   const session = await auth()
   if (!session) redirect("/login")
@@ -19,24 +21,30 @@ export default async function HomePage() {
 
   const secondMatch = upcomingMatches?.[1] ?? null
 
-  // Check if current user has a team for the next two matches
-  const { data: myNextTeam } = nextMatch
-    ? await supabaseAdmin
-        .from("teams")
-        .select("id")
-        .eq("match_id", nextMatch.id)
-        .eq("user_id", session.user.id)
-        .maybeSingle()
-    : { data: null }
+  // Fetch all users in the league
+  const { data: allUsers } = await supabaseAdmin
+    .from("users")
+    .select("id, name")
 
-  const { data: mySecondTeam } = secondMatch
+  // Fetch all submitted teams for upcoming matches in one query
+  const upcomingIds = (upcomingMatches || []).map(m => m.id)
+  const { data: allUpcomingTeams } = upcomingIds.length > 0
     ? await supabaseAdmin
         .from("teams")
-        .select("id")
-        .eq("match_id", secondMatch.id)
-        .eq("user_id", session.user.id)
-        .maybeSingle()
-    : { data: null }
+        .select("match_id, user_id")
+        .in("match_id", upcomingIds)
+    : { data: [] }
+
+  // Helper: get first names of who has/hasn't submitted for a match
+  function getSubmissionStatus(matchId: string) {
+    const submittedUserIds = new Set((allUpcomingTeams || []).filter(t => t.match_id === matchId).map(t => t.user_id))
+    const done = (allUsers || []).filter(u => submittedUserIds.has(u.id)).map(u => u.name.split(" ")[0])
+    const pending = (allUsers || []).filter(u => !submittedUserIds.has(u.id)).map(u => u.name.split(" ")[0])
+    return { done, pending }
+  }
+
+  const myNextTeam = nextMatch ? (allUpcomingTeams || []).find(t => t.match_id === nextMatch.id && t.user_id === session.user.id) : null
+  const mySecondTeam = secondMatch ? (allUpcomingTeams || []).find(t => t.match_id === secondMatch.id && t.user_id === session.user.id) : null
 
   // Fetch last completed match with results
   const { data: lastMatch } = await supabaseAdmin
@@ -87,6 +95,21 @@ export default async function HomePage() {
                 dateStyle: "medium", timeStyle: "short", timeZone: "Asia/Kolkata"
               })} · {nextMatch.venue}
             </p>
+            {/* Who has submitted */}
+            {(() => {
+              const { done, pending } = getSubmissionStatus(nextMatch.id)
+              return (done.length > 0 || pending.length > 0) ? (
+                <div className="flex flex-wrap gap-1.5 mb-4">
+                  {done.map(name => (
+                    <span key={name} className="text-xs bg-green-900/40 text-green-400 border border-green-800/50 px-2 py-0.5 rounded-full">✓ {name}</span>
+                  ))}
+                  {pending.map(name => (
+                    <span key={name} className="text-xs bg-gray-800 text-gray-500 border border-gray-700 px-2 py-0.5 rounded-full">{name}</span>
+                  ))}
+                </div>
+              ) : null
+            })()}
+
             <div className="flex items-center justify-between">
               <span className="text-sm text-gray-400">
                 💰 Prize Pool: <span className="text-yellow-400 font-semibold">₹{nextMatch.base_prize + (nextMatch.rollover_added || 0)}</span>
@@ -138,26 +161,41 @@ export default async function HomePage() {
                 const hasTeam = isSecond ? !!mySecondTeam : false
                 const canPick = isSecond && m.status === "upcoming"
                 return (
-                  <div key={m.id} className={`flex items-center justify-between ${isSecond ? "pb-3 border-b border-gray-800" : ""}`}>
-                    <div>
-                      <p className="text-white text-sm font-medium">{m.team1} vs {m.team2}</p>
-                      <p className="text-gray-500 text-xs">
-                        {new Date(m.scheduled_at).toLocaleString("en-IN", {
-                          dateStyle: "medium", timeStyle: "short", timeZone: "Asia/Kolkata"
-                        })}
-                      </p>
-                      <p className="text-gray-600 text-xs">M{m.match_number} · ₹{m.base_prize + (m.rollover_added || 0)}</p>
+                  <div key={m.id} className={`${isSecond ? "pb-3 border-b border-gray-800" : ""}`}>
+                    <div className="flex items-center justify-between">
+                      <div>
+                        <p className="text-white text-sm font-medium">{m.team1} vs {m.team2}</p>
+                        <p className="text-gray-500 text-xs">
+                          {new Date(m.scheduled_at).toLocaleString("en-IN", {
+                            dateStyle: "medium", timeStyle: "short", timeZone: "Asia/Kolkata"
+                          })}
+                        </p>
+                        <p className="text-gray-600 text-xs">M{m.match_number} · ₹{m.base_prize + (m.rollover_added || 0)}</p>
+                      </div>
+                      {canPick ? (
+                        <a
+                          href={`/match/${m.id}/team`}
+                          className="bg-yellow-400/10 border border-yellow-400/40 text-yellow-400 text-xs font-semibold px-3 py-1.5 rounded-xl hover:bg-yellow-400/20 transition whitespace-nowrap"
+                        >
+                          {hasTeam ? "Edit →" : "Pick →"}
+                        </a>
+                      ) : (
+                        <p className="text-yellow-400 text-xs font-semibold">₹{m.base_prize + (m.rollover_added || 0)}</p>
+                      )}
                     </div>
-                    {canPick ? (
-                      <a
-                        href={`/match/${m.id}/team`}
-                        className="bg-yellow-400/10 border border-yellow-400/40 text-yellow-400 text-xs font-semibold px-3 py-1.5 rounded-xl hover:bg-yellow-400/20 transition whitespace-nowrap"
-                      >
-                        {hasTeam ? "Edit →" : "Pick →"}
-                      </a>
-                    ) : (
-                      <p className="text-yellow-400 text-xs font-semibold">₹{m.base_prize + (m.rollover_added || 0)}</p>
-                    )}
+                    {(() => {
+                      const { done, pending } = getSubmissionStatus(m.id)
+                      return (done.length > 0 || pending.length > 0) ? (
+                        <div className="flex flex-wrap gap-1 mt-2">
+                          {done.map(name => (
+                            <span key={name} className="text-xs bg-green-900/40 text-green-400 border border-green-800/50 px-2 py-0.5 rounded-full">✓ {name}</span>
+                          ))}
+                          {pending.map(name => (
+                            <span key={name} className="text-xs bg-gray-800 text-gray-500 border border-gray-700 px-2 py-0.5 rounded-full">{name}</span>
+                          ))}
+                        </div>
+                      ) : null
+                    })()}
                   </div>
                 )
               })}
