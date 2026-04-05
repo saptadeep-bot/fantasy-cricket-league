@@ -24,7 +24,8 @@ export async function POST(req: NextRequest, { params }: { params: Promise<{ id:
   try {
     // Step 1: Fetch final scorecard and calculate points using custom IPL ruleset
     const res = await fetch(
-      `https://api.cricapi.com/v1/match_scorecard?apikey=${CRICKETDATA_API_KEY}&id=${match.cricketdata_match_id}`
+      `https://api.cricapi.com/v1/match_scorecard?apikey=${CRICKETDATA_API_KEY}&id=${match.cricketdata_match_id}`,
+      { cache: "no-store" }
     )
     const data = await res.json()
 

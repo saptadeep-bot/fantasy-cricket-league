@@ -7,7 +7,8 @@ const CRICKETDATA_API_KEY = process.env.CRICKETDATA_API_KEY!
 
 async function fetchAndSaveScores(matchId: string, cricketdataMatchId: string) {
   const res = await fetch(
-    `https://api.cricapi.com/v1/match_scorecard?apikey=${CRICKETDATA_API_KEY}&id=${cricketdataMatchId}`
+    `https://api.cricapi.com/v1/match_scorecard?apikey=${CRICKETDATA_API_KEY}&id=${cricketdataMatchId}`,
+    { cache: "no-store" }
   )
   const data = await res.json()
 

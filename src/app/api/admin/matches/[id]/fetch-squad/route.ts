@@ -32,7 +32,8 @@ export async function POST(req: NextRequest, { params }: { params: Promise<{ id:
 
   try {
     const res = await fetch(
-      `https://api.cricapi.com/v1/match_squad?apikey=${CRICKETDATA_API_KEY}&id=${match.cricketdata_match_id}`
+      `https://api.cricapi.com/v1/match_squad?apikey=${CRICKETDATA_API_KEY}&id=${match.cricketdata_match_id}`,
+      { cache: "no-store" }
     )
     const data = await res.json()
 
