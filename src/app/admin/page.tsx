@@ -1,6 +1,7 @@
 import { auth } from "@/auth"
 import { redirect } from "next/navigation"
 import Navbar from "@/components/Navbar"
+import RecalculatePrizesButton from "./RecalculatePrizesButton"
 
 export default async function AdminPage() {
   const session = await auth()
@@ -29,6 +30,16 @@ export default async function AdminPage() {
             <h2 className="font-semibold text-white">💰 Payout Ledger</h2>
             <p className="text-gray-500 text-sm mt-1">Track settlements and balances</p>
           </a>
+
+          {/* One-time retroactive prize recalculation */}
+          <div className="bg-gray-900 border border-gray-800 rounded-2xl p-5">
+            <h2 className="font-semibold text-white mb-1">🔄 Recalculate All Prizes</h2>
+            <p className="text-gray-500 text-sm mb-4">
+              Recalculates prize payouts for all completed matches using the new system: ₹250 per person · 65% to 1st · 35% to 2nd.
+              Run this once to fix all past matches.
+            </p>
+            <RecalculatePrizesButton />
+          </div>
         </div>
       </main>
     </div>

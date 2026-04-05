@@ -39,7 +39,14 @@ export default async function LeaderboardPage() {
       secondPlaceWins: userResults.filter(r => r.rank === 2).length,
       totalPrizeWon: Math.round(userResults.reduce((s, r) => s + (r.prize_won || 0), 0) * 100) / 100,
     }
-  }).sort((a, b) => b.totalPoints - a.totalPoints)
+  }).sort((a, b) => {
+    // Primary: total money earned
+    if (b.totalPrizeWon !== a.totalPrizeWon) return b.totalPrizeWon - a.totalPrizeWon
+    // Secondary: number of wins
+    if (b.firstPlaceWins !== a.firstPlaceWins) return b.firstPlaceWins - a.firstPlaceWins
+    // Tertiary: total points
+    return b.totalPoints - a.totalPoints
+  })
 
   const currentUserId = session.user.id
 

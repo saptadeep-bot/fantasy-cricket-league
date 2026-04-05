@@ -5,6 +5,13 @@ import { supabaseAdmin } from "@/lib/supabase"
 
 export const dynamic = "force-dynamic"
 
+function getEntryFee(matchType: string): number {
+  const type = (matchType || "league").toLowerCase()
+  if (type === "final") return 500
+  if (type === "eliminator" || type === "qualifier" || type.includes("qualifier") || type.includes("eliminator")) return 350
+  return 250
+}
+
 export default async function HomePage() {
   const session = await auth()
   if (!session) redirect("/login")
@@ -112,7 +119,8 @@ export default async function HomePage() {
 
             <div className="flex items-center justify-between">
               <span className="text-sm text-gray-400">
-                💰 Prize Pool: <span className="text-yellow-400 font-semibold">₹{nextMatch.base_prize + (nextMatch.rollover_added || 0)}</span>
+                💰 Entry: <span className="text-yellow-400 font-semibold">₹{getEntryFee(nextMatch.match_type)}/person</span>
+                <span className="text-gray-600 text-xs ml-2">Pool: ₹{getEntryFee(nextMatch.match_type) * (allUsers?.length || 0)}</span>
               </span>
               {nextMatch.status === "upcoming" ? (
                 <a
@@ -170,7 +178,7 @@ export default async function HomePage() {
                             dateStyle: "medium", timeStyle: "short", timeZone: "Asia/Kolkata"
                           })}
                         </p>
-                        <p className="text-gray-600 text-xs">M{m.match_number} · ₹{m.base_prize + (m.rollover_added || 0)}</p>
+                        <p className="text-gray-600 text-xs">M{m.match_number} · Entry ₹{getEntryFee(m.match_type)}</p>
                       </div>
                       {canPick ? (
                         <a
@@ -180,7 +188,7 @@ export default async function HomePage() {
                           {hasTeam ? "Edit →" : "Pick →"}
                         </a>
                       ) : (
-                        <p className="text-yellow-400 text-xs font-semibold">₹{m.base_prize + (m.rollover_added || 0)}</p>
+                        <p className="text-yellow-400 text-xs font-semibold">₹{getEntryFee(m.match_type)}/person</p>
                       )}
                     </div>
                     {(() => {

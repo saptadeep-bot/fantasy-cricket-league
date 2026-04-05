@@ -126,11 +126,13 @@ export async function POST(req: NextRequest, { params }: { params: Promise<{ id:
       currentRank++
     }
 
-    // Step 6: Calculate prizes
+    // Step 6: Calculate prizes — entry fee depends on match type, 65/35 split
+    const matchType = (match.match_type || "league").toLowerCase()
+    const ENTRY_FEE = matchType === "final" ? 500
+      : (matchType === "eliminator" || matchType === "qualifier" || matchType.includes("qualifier") || matchType.includes("eliminator")) ? 350
+      : 250 // league
     const participants = teams.length
-    const basePrizePool = (match.base_prize || 0) + (match.rollover_added || 0)
-    const actualPrizePool = basePrizePool * (participants / 5)
-    const unspent = basePrizePool * ((5 - participants) / 5)
+    const totalPool = ENTRY_FEE * participants
 
     const results: Array<{
       match_id: string
@@ -141,48 +143,24 @@ export async function POST(req: NextRequest, { params }: { params: Promise<{ id:
       prize_won: number
     }> = []
 
-    if (participants < 3) {
-      // No payout — rollover to next match
-      const { data: nextMatch } = await supabaseAdmin
-        .from("matches")
-        .select("id, rollover_added, base_prize")
-        .eq("status", "upcoming")
-        .order("scheduled_at", { ascending: true })
-        .limit(1)
-        .single()
-
-      if (nextMatch) {
-        await supabaseAdmin
-          .from("matches")
-          .update({ rollover_added: (nextMatch.rollover_added || 0) + basePrizePool })
-          .eq("id", nextMatch.id)
-      }
-
-      for (const r of ranked) {
-        results.push({ match_id: id, user_id: r.user_id, rank: r.rank, raw_points: r.raw_points, final_points: r.final_points, prize_won: 0 })
-      }
+    if (participants === 1) {
+      // Only 1 player — full refund
+      results.push({ match_id: id, user_id: ranked[0].user_id, rank: 1, raw_points: ranked[0].raw_points, final_points: ranked[0].final_points, prize_won: ENTRY_FEE })
     } else {
-      // Determine winners
+      // 2+ players: 65% to 1st, 35% to 2nd
       const firstPlaceScore = ranked[0].final_points
       const firstPlacers = ranked.filter(r => r.final_points === firstPlaceScore)
+      const nonFirst = ranked.filter(r => r.final_points < firstPlaceScore)
+      const secondPlacers = nonFirst.length > 0
+        ? nonFirst.filter(r => r.final_points === nonFirst[0].final_points)
+        : []
 
-      let secondPlacers: typeof ranked = []
-      if (participants >= 4) {
-        // Find 2nd place (only if there are participants not in 1st place)
-        const nonFirst = ranked.filter(r => r.final_points < firstPlaceScore)
-        if (nonFirst.length > 0) {
-          const secondPlaceScore = nonFirst[0].final_points
-          secondPlacers = nonFirst.filter(r => r.final_points === secondPlaceScore)
-        }
-      }
+      // If everyone ties for 1st, split pool equally
+      const firstPrize = secondPlacers.length === 0 ? totalPool : Math.round(totalPool * 0.65)
+      const secondPrize = secondPlacers.length > 0 ? totalPool - firstPrize : 0
 
-      const firstPrize = actualPrizePool * 0.65
-      const secondPrize = actualPrizePool * 0.35
-
-      // If all participants tie for 1st (no 2nd place), split everything
-      const totalFirstPrize = secondPlacers.length === 0 ? actualPrizePool : firstPrize
-      const prizePerFirst = totalFirstPrize / firstPlacers.length
-      const prizePerSecond = secondPlacers.length > 0 ? secondPrize / secondPlacers.length : 0
+      const prizePerFirst = Math.round(firstPrize / firstPlacers.length)
+      const prizePerSecond = secondPlacers.length > 0 ? Math.round(secondPrize / secondPlacers.length) : 0
 
       for (const r of ranked) {
         let prize = 0
@@ -194,16 +172,7 @@ export async function POST(req: NextRequest, { params }: { params: Promise<{ id:
           rank: r.rank,
           raw_points: r.raw_points,
           final_points: r.final_points,
-          prize_won: Math.round(prize * 100) / 100,
-        })
-      }
-
-      // Add unspent to season reserve
-      if (unspent > 0) {
-        await supabaseAdmin.from("season_reserve").insert({
-          match_id: id,
-          amount: Math.round(unspent * 100) / 100,
-          reason: "low_participation",
+          prize_won: prize,
         })
       }
     }
@@ -219,6 +188,7 @@ export async function POST(req: NextRequest, { params }: { params: Promise<{ id:
     return NextResponse.json({
       success: true,
       participants,
+      totalPool: 250 * participants,
       results: results.map(r => ({ user_id: r.user_id, rank: r.rank, final_points: r.final_points, prize_won: r.prize_won }))
     })
   } catch (err) {
