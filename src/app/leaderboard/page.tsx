@@ -2,9 +2,15 @@ import { auth } from "@/auth"
 import { redirect } from "next/navigation"
 import { supabaseAdmin } from "@/lib/supabase"
 import Navbar from "@/components/Navbar"
-import Link from "next/link"
 
 export const revalidate = 0
+
+function getEntryFee(matchType: string): number {
+  const type = (matchType || "league").toLowerCase()
+  if (type === "final") return 500
+  if (type === "eliminator" || type === "qualifier" || type.includes("qualifier") || type.includes("eliminator")) return 350
+  return 250
+}
 
 export default async function LeaderboardPage() {
   const session = await auth()
@@ -15,10 +21,10 @@ export default async function LeaderboardPage() {
     .from("users")
     .select("id, name")
 
-  // Fetch all match results
+  // Fetch all match results joined with match_type
   const { data: results } = await supabaseAdmin
     .from("match_results")
-    .select("user_id, rank, final_points, prize_won")
+    .select("user_id, rank, final_points, prize_won, matches(match_type)")
 
   // Fetch total season reserve
   const { data: reserve } = await supabaseAdmin
@@ -28,22 +34,34 @@ export default async function LeaderboardPage() {
   const totalReserve = reserve?.reduce((sum, r) => sum + (r.amount || 0), 0) || 0
 
   // Compute per-user stats
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
   const stats = (users || []).map(user => {
-    const userResults = (results || []).filter(r => r.user_id === user.id)
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const userResults = (results || []).filter((r: any) => r.user_id === user.id)
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const totalInvested = userResults.reduce((s: number, r: any) => s + getEntryFee(r.matches?.match_type || "league"), 0)
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const totalPrizeWon = userResults.reduce((s: number, r: any) => s + (r.prize_won || 0), 0)
     return {
       id: user.id,
       name: user.name,
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
       matchesPlayed: userResults.length,
-      totalPoints: Math.round(userResults.reduce((s, r) => s + (r.final_points || 0), 0) * 10) / 10,
-      firstPlaceWins: userResults.filter(r => r.rank === 1).length,
-      secondPlaceWins: userResults.filter(r => r.rank === 2).length,
-      totalPrizeWon: Math.round(userResults.reduce((s, r) => s + (r.prize_won || 0), 0) * 100) / 100,
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      totalPoints: Math.round(userResults.reduce((s: number, r: any) => s + (r.final_points || 0), 0) * 10) / 10,
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      firstPlaceWins: userResults.filter((r: any) => r.rank === 1).length,
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      secondPlaceWins: userResults.filter((r: any) => r.rank === 2).length,
+      totalPrizeWon,
+      totalInvested,
+      netPnL: totalPrizeWon - totalInvested,
     }
   }).sort((a, b) => {
-    // Primary: total money earned
+    // Primary: net P&L (profit first)
+    if (b.netPnL !== a.netPnL) return b.netPnL - a.netPnL
+    // Secondary: total money earned
     if (b.totalPrizeWon !== a.totalPrizeWon) return b.totalPrizeWon - a.totalPrizeWon
-    // Secondary: number of wins
-    if (b.firstPlaceWins !== a.firstPlaceWins) return b.firstPlaceWins - a.firstPlaceWins
     // Tertiary: total points
     return b.totalPoints - a.totalPoints
   })
@@ -93,10 +111,10 @@ export default async function LeaderboardPage() {
                       </div>
                     </div>
                     <div className="text-right">
-                      <p className="text-white font-bold">{player.totalPoints} pts</p>
-                      {player.totalPrizeWon > 0 && (
-                        <p className="text-yellow-400 text-sm">₹{player.totalPrizeWon} won</p>
-                      )}
+                      <p className={`font-bold text-sm ${player.netPnL > 0 ? "text-green-400" : player.netPnL < 0 ? "text-red-400" : "text-gray-400"}`}>
+                        {player.netPnL > 0 ? "+" : ""}₹{player.netPnL}
+                      </p>
+                      <p className="text-gray-500 text-xs">{player.totalPoints} pts</p>
                     </div>
                   </div>
                 </div>
@@ -124,8 +142,8 @@ export default async function LeaderboardPage() {
                     </div>
                     <p className="text-white font-bold">{player.totalPoints} pts</p>
                   </div>
-                  {/* Stats row */}
-                  <div className="grid grid-cols-4 gap-2">
+                  {/* Row 1: Match stats */}
+                  <div className="grid grid-cols-3 gap-2 mb-2">
                     <div className="bg-gray-800 rounded-xl p-2 text-center">
                       <p className="text-gray-500 text-xs mb-0.5">Played</p>
                       <p className="text-white font-semibold text-sm">{player.matchesPlayed}</p>
@@ -138,9 +156,22 @@ export default async function LeaderboardPage() {
                       <p className="text-gray-500 text-xs mb-0.5">🥈 Wins</p>
                       <p className="text-gray-300 font-semibold text-sm">{player.secondPlaceWins}</p>
                     </div>
+                  </div>
+                  {/* Row 2: Money stats */}
+                  <div className="grid grid-cols-3 gap-2">
+                    <div className="bg-gray-800 rounded-xl p-2 text-center">
+                      <p className="text-gray-500 text-xs mb-0.5">Invested</p>
+                      <p className="text-gray-300 font-semibold text-sm">₹{player.totalInvested}</p>
+                    </div>
                     <div className="bg-gray-800 rounded-xl p-2 text-center">
                       <p className="text-gray-500 text-xs mb-0.5">Earned</p>
                       <p className="text-green-400 font-semibold text-sm">₹{player.totalPrizeWon}</p>
+                    </div>
+                    <div className="bg-gray-800 rounded-xl p-2 text-center">
+                      <p className="text-gray-500 text-xs mb-0.5">Net P&L</p>
+                      <p className={`font-semibold text-sm ${player.netPnL > 0 ? "text-green-400" : player.netPnL < 0 ? "text-red-400" : "text-gray-400"}`}>
+                        {player.netPnL > 0 ? "+" : ""}₹{player.netPnL}
+                      </p>
                     </div>
                   </div>
                 </div>
