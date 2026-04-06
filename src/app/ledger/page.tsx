@@ -18,6 +18,11 @@ export default async function LedgerPage() {
     .select("*, matches(name, match_number, scheduled_at, match_type), users(name)")
     .order("created_at", { ascending: false })
 
+  // Fetch pre-app historical stats
+  const { data: historicalStats } = await supabaseAdmin
+    .from("player_historical_stats")
+    .select("*")
+
   function getEntryFee(matchType: string): number {
     const type = (matchType || "league").toLowerCase()
     if (type === "final") return 500
@@ -31,9 +36,13 @@ export default async function LedgerPage() {
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     const userResults = (results || []).filter((r: any) => r.user_id === user.id)
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    const totalWon = userResults.reduce((s: number, r: any) => s + (r.prize_won || 0), 0)
+    const hist = (historicalStats || []).find((h: any) => h.user_id === user.id)
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    const totalInvested = userResults.reduce((s: number, r: any) => s + getEntryFee(r.matches?.match_type || "league"), 0)
+    const appWon = userResults.reduce((s: number, r: any) => s + (r.prize_won || 0), 0)
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const appInvested = userResults.reduce((s: number, r: any) => s + getEntryFee(r.matches?.match_type || "league"), 0)
+    const totalWon = appWon + (hist?.extra_prize_won || 0)
+    const totalInvested = appInvested + (hist?.extra_invested || 0)
     return {
       id: user.id,
       name: user.name,

@@ -2,7 +2,7 @@ import { auth } from "@/auth"
 import { redirect } from "next/navigation"
 import Navbar from "@/components/Navbar"
 import RecalculatePrizesButton from "./RecalculatePrizesButton"
-import SeedHistoricalButton from "./SeedHistoricalButton"
+import SeedHistoricalStatsButton from "./SeedHistoricalStatsButton"
 
 export default async function AdminPage() {
   const session = await auth()
@@ -32,13 +32,13 @@ export default async function AdminPage() {
             <p className="text-gray-500 text-sm mt-1">Track settlements and balances</p>
           </a>
 
-          {/* Pre-app historical match seeder */}
+          {/* Pre-app historical stats */}
           <div className="bg-gray-900 border border-gray-800 rounded-2xl p-5">
-            <h2 className="font-semibold text-white mb-1">📜 Add Pre-App Match History</h2>
+            <h2 className="font-semibold text-white mb-1">📜 Add Pre-App Stats to Leaderboard</h2>
             <p className="text-gray-500 text-sm mb-4">
-              Seeds the 6 matches played before the app was built (Matches 1–6). Safe to run once — skips if already added.
+              Adds the 6 matches played before the app to each player&apos;s leaderboard totals. No match records created — just stats.
             </p>
-            <SeedHistoricalButton />
+            <SeedHistoricalStatsButton />
           </div>
 
           {/* One-time retroactive prize recalculation */}

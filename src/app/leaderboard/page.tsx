@@ -26,26 +26,37 @@ export default async function LeaderboardPage() {
     .from("match_results")
     .select("user_id, rank, final_points, prize_won, matches(match_type)")
 
+  // Fetch pre-app historical stats
+  const { data: historicalStats } = await supabaseAdmin
+    .from("player_historical_stats")
+    .select("*")
+
   // Compute per-user stats
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   const stats = (users || []).map(user => {
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     const userResults = (results || []).filter((r: any) => r.user_id === user.id)
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    const totalInvested = userResults.reduce((s: number, r: any) => s + getEntryFee(r.matches?.match_type || "league"), 0)
+    const hist = (historicalStats || []).find((h: any) => h.user_id === user.id)
+
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    const totalPrizeWon = userResults.reduce((s: number, r: any) => s + (r.prize_won || 0), 0)
+    const appInvested = userResults.reduce((s: number, r: any) => s + getEntryFee(r.matches?.match_type || "league"), 0)
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const appPrizeWon = userResults.reduce((s: number, r: any) => s + (r.prize_won || 0), 0)
+
+    const totalInvested = appInvested + (hist?.extra_invested || 0)
+    const totalPrizeWon = appPrizeWon + (hist?.extra_prize_won || 0)
+
     return {
       id: user.id,
       name: user.name,
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      matchesPlayed: userResults.length,
+      matchesPlayed: userResults.length + (hist?.extra_matches_played || 0),
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
       totalPoints: Math.round(userResults.reduce((s: number, r: any) => s + (r.final_points || 0), 0) * 10) / 10,
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      firstPlaceWins: userResults.filter((r: any) => r.rank === 1).length,
+      firstPlaceWins: userResults.filter((r: any) => r.rank === 1).length + (hist?.extra_first_wins || 0),
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      secondPlaceWins: userResults.filter((r: any) => r.rank === 2).length,
+      secondPlaceWins: userResults.filter((r: any) => r.rank === 2).length + (hist?.extra_second_wins || 0),
       totalPrizeWon,
       totalInvested,
       netPnL: totalPrizeWon - totalInvested,
