@@ -8,7 +8,7 @@ export async function POST(req: NextRequest, { params }: { params: Promise<{ id:
     return NextResponse.json({ error: "Unauthorized" }, { status: 401 })
   }
 
-  const { selectedPlayerIds }: { selectedPlayerIds: string[] } = await req.json()
+  const { selectedPlayerIds, substitutePlayerIds = [] }: { selectedPlayerIds: string[], substitutePlayerIds: string[] } = await req.json()
 
   if (!selectedPlayerIds || selectedPlayerIds.length === 0) {
     return NextResponse.json({ error: "No players provided" }, { status: 400 })
@@ -35,15 +35,28 @@ export async function POST(req: NextRequest, { params }: { params: Promise<{ id:
     return NextResponse.json({ error: "Please fetch squad first" }, { status: 400 })
   }
 
-  // Mark all as not playing, then mark selected as playing
-  await supabaseAdmin.from("match_players").update({ is_playing: false }).eq("match_id", id)
-  const { error } = await supabaseAdmin
-    .from("match_players")
-    .update({ is_playing: true })
-    .eq("match_id", id)
-    .in("cricketdata_player_id", selectedPlayerIds)
+  // Reset all players
+  await supabaseAdmin.from("match_players").update({ is_playing: false, is_substitute: false }).eq("match_id", id)
 
-  if (error) return NextResponse.json({ error: error.message }, { status: 500 })
+  // Mark all announced players as playing
+  if (selectedPlayerIds.length > 0) {
+    const { error } = await supabaseAdmin
+      .from("match_players")
+      .update({ is_playing: true, is_substitute: false })
+      .eq("match_id", id)
+      .in("cricketdata_player_id", selectedPlayerIds)
+    if (error) return NextResponse.json({ error: error.message }, { status: 500 })
+  }
+
+  // Mark impact substitutes
+  if (substitutePlayerIds.length > 0) {
+    const { error } = await supabaseAdmin
+      .from("match_players")
+      .update({ is_playing: true, is_substitute: true })
+      .eq("match_id", id)
+      .in("cricketdata_player_id", substitutePlayerIds)
+    if (error) return NextResponse.json({ error: error.message }, { status: 500 })
+  }
 
   return NextResponse.json({ success: true })
 }

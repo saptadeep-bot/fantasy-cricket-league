@@ -10,6 +10,7 @@ interface Player {
   role: "BAT" | "BOWL" | "ALL" | "WK"
   fantasy_points: number
   is_playing?: boolean
+  is_substitute?: boolean
 }
 
 interface Match {
@@ -66,8 +67,12 @@ export default function TeamPicker({
     else if (filter === "ALL") list = players
     else if (filter === "ALL_ROLE") list = players.filter(p => p.role === "ALL")
     else list = players.filter(p => p.role === filter)
-    // Announced players shown first
-    return [...list].sort((a, b) => (b.is_playing ? 1 : 0) - (a.is_playing ? 1 : 0))
+    // Sort: XI first, then subs, then unannounced
+    return [...list].sort((a, b) => {
+      const scoreA = a.is_playing && !a.is_substitute ? 2 : a.is_substitute ? 1 : 0
+      const scoreB = b.is_playing && !b.is_substitute ? 2 : b.is_substitute ? 1 : 0
+      return scoreB - scoreA
+    })
   }, [filter, players, match])
 
   function togglePlayer(playerId: string) {
@@ -139,7 +144,7 @@ export default function TeamPicker({
     }
   }
 
-  const anyAnnounced = players.some(p => p.is_playing)
+  const anyAnnounced = players.some(p => p.is_playing || p.is_substitute)
 
   const filterTabs: { key: FilterKey; label: string }[] = [
     { key: "ALL", label: "All" },
@@ -177,9 +182,15 @@ export default function TeamPicker({
 
       {/* Announced players legend */}
       {anyAnnounced && (
-        <div className="flex items-center gap-2 px-1">
-          <span className="w-3 h-3 rounded-sm bg-green-900/40 border border-green-800/60 flex-shrink-0" />
-          <span className="text-gray-500 text-xs">Green = announced playing XI after toss</span>
+        <div className="flex items-center gap-3 px-1 flex-wrap">
+          <div className="flex items-center gap-1.5">
+            <span className="w-3 h-3 rounded-sm bg-green-900/40 border border-green-800/60 flex-shrink-0" />
+            <span className="text-gray-500 text-xs">Green = Playing XI</span>
+          </div>
+          <div className="flex items-center gap-1.5">
+            <span className="w-3 h-3 rounded-sm bg-orange-900/40 border border-orange-800/60 flex-shrink-0" />
+            <span className="text-gray-500 text-xs">Orange = Impact Sub</span>
+          </div>
         </div>
       )}
 
@@ -212,10 +223,14 @@ export default function TeamPicker({
               key={player.cricketdata_player_id}
               className={`rounded-xl border transition ${
                 isSelected
-                  ? player.is_playing
+                  ? player.is_substitute
+                    ? "bg-orange-400/10 border-orange-400/50"
+                    : player.is_playing
                     ? "bg-green-400/10 border-green-400/50"
                     : "bg-yellow-400/5 border-yellow-400/40"
-                  : player.is_playing
+                  : player.is_substitute
+                    ? "bg-orange-900/20 border-orange-800/60"
+                    : player.is_playing
                     ? "bg-green-900/20 border-green-800/60"
                     : "bg-gray-900 border-gray-800"
               }`}
@@ -239,7 +254,8 @@ export default function TeamPicker({
                     <span className="text-white text-sm font-medium truncate">{player.name}</span>
                     {isCaptain && <span className="text-xs bg-yellow-400 text-gray-900 px-1.5 py-0.5 rounded font-bold">C</span>}
                     {isVc && <span className="text-xs bg-gray-400 text-gray-900 px-1.5 py-0.5 rounded font-bold">VC</span>}
-                    {player.is_playing && <span className="text-xs bg-green-500 text-white px-1.5 py-0.5 rounded font-semibold">✓ Playing</span>}
+                    {player.is_playing && !player.is_substitute && <span className="text-xs bg-green-500 text-white px-1.5 py-0.5 rounded font-semibold">✓ XI</span>}
+                    {player.is_substitute && <span className="text-xs bg-orange-500 text-white px-1.5 py-0.5 rounded font-semibold">⚡ Sub</span>}
                   </div>
                   <div className="flex items-center gap-2 mt-0.5">
                     <span className={`text-xs px-1.5 py-0.5 rounded font-medium ${ROLE_COLORS[player.role]}`}>

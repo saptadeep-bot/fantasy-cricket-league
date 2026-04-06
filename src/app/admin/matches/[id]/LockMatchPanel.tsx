@@ -9,6 +9,7 @@ interface Player {
   team: string
   role: string
   is_playing?: boolean
+  is_substitute?: boolean
 }
 
 interface Match {
@@ -38,7 +39,10 @@ export default function LockMatchPanel({
   const [squadPlayers, setSquadPlayers] = useState<Player[]>(existingPlayers)
   // Pre-select announced players if squad was previously confirmed
   const [selectedXI, setSelectedXI] = useState<Set<string>>(
-    new Set(existingPlayers.filter(p => p.is_playing).map(p => p.cricketdata_player_id))
+    new Set(existingPlayers.filter(p => p.is_playing && !p.is_substitute).map(p => p.cricketdata_player_id))
+  )
+  const [substituteIds, setSubstituteIds] = useState<Set<string>>(
+    new Set(existingPlayers.filter(p => p.is_substitute).map(p => p.cricketdata_player_id))
   )
   const [loading, setLoading] = useState(false)
   const [locking, setLocking] = useState(false)
@@ -70,25 +74,36 @@ export default function LockMatchPanel({
     }
   }
 
+  // Cycle: unselected → XI → Sub → unselected
   function togglePlayer(playerId: string) {
     if (alreadyLocked) return
-    setSelectedXI(prev => {
-      const next = new Set(prev)
-      if (next.has(playerId)) next.delete(playerId)
-      else next.add(playerId)
-      return next
-    })
+    const isXI = selectedXI.has(playerId)
+    const isSub = substituteIds.has(playerId)
+
+    if (!isXI && !isSub) {
+      // unselected → XI
+      setSelectedXI(prev => new Set([...prev, playerId]))
+    } else if (isXI && !isSub) {
+      // XI → Sub
+      setSelectedXI(prev => { const n = new Set(prev); n.delete(playerId); return n })
+      setSubstituteIds(prev => new Set([...prev, playerId]))
+    } else {
+      // Sub → unselected
+      setSubstituteIds(prev => { const n = new Set(prev); n.delete(playerId); return n })
+    }
   }
 
-  // Validation
+  // Validation — count XI + subs per team (all announced)
   const uniqueTeams = [...new Set(squadPlayers.map(p => p.team))].filter(Boolean)
-  const selectedPlayers = squadPlayers.filter(p => selectedXI.has(p.cricketdata_player_id))
-  const team1Players = selectedPlayers.filter(p => p.team === (uniqueTeams[0] || match.team1))
-  const team2Players = selectedPlayers.filter(p => p.team === (uniqueTeams[1] || match.team2))
+  const allAnnouncedIds = new Set([...selectedXI, ...substituteIds])
+  const announcedPlayers = squadPlayers.filter(p => allAnnouncedIds.has(p.cricketdata_player_id))
+  const team1Players = announcedPlayers.filter(p => p.team === (uniqueTeams[0] || match.team1))
+  const team2Players = announcedPlayers.filter(p => p.team === (uniqueTeams[1] || match.team2))
+  const xiOnly = squadPlayers.filter(p => selectedXI.has(p.cricketdata_player_id))
+  const team1XI = xiOnly.filter(p => p.team === (uniqueTeams[0] || match.team1))
+  const team2XI = xiOnly.filter(p => p.team === (uniqueTeams[1] || match.team2))
   const isValidXI =
-    team1Players.length >= 11 && team1Players.length <= 15 &&
-    team2Players.length >= 11 && team2Players.length <= 15 &&
-    team1Players.length + team2Players.length >= 22
+    team1XI.length === 11 && team2XI.length === 11
 
   async function confirmAnnounced() {
     if (!isValidXI) return
@@ -98,7 +113,10 @@ export default function LockMatchPanel({
       const res = await fetch(`/api/admin/matches/${match.id}/lock`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ selectedPlayerIds: Array.from(selectedXI) }),
+        body: JSON.stringify({
+          selectedPlayerIds: Array.from(selectedXI),
+          substitutePlayerIds: Array.from(substituteIds),
+        }),
       })
       const data = await res.json()
       if (data.success) {
@@ -169,21 +187,29 @@ export default function LockMatchPanel({
               <div key={team} className="bg-gray-900 border border-gray-800 rounded-2xl p-5">
                 <div className="flex items-center justify-between mb-3">
                   <h3 className="font-semibold text-white">{team}</h3>
-                  <span className={`text-sm font-medium ${selectedCount >= 11 && selectedCount <= 15 ? "text-green-400" : "text-yellow-400"}`}>
-                    {selectedCount} announced (11–15)
-                  </span>
+                  <div className="flex items-center gap-2 text-xs">
+                    <span className={`font-semibold ${players.filter(p => selectedXI.has(p.cricketdata_player_id)).length === 11 ? "text-green-400" : "text-yellow-400"}`}>
+                      XI: {players.filter(p => selectedXI.has(p.cricketdata_player_id)).length}/11
+                    </span>
+                    <span className="text-orange-400 font-semibold">
+                      Sub: {players.filter(p => substituteIds.has(p.cricketdata_player_id)).length}
+                    </span>
+                  </div>
                 </div>
                 <div className="space-y-2">
                   {players.map(player => {
-                    const isSelected = selectedXI.has(player.cricketdata_player_id)
+                    const isXI = selectedXI.has(player.cricketdata_player_id)
+                    const isSub = substituteIds.has(player.cricketdata_player_id)
                     return (
                       <button
                         key={player.cricketdata_player_id}
                         onClick={() => togglePlayer(player.cricketdata_player_id)}
                         disabled={alreadyLocked}
                         className={`w-full flex items-center justify-between px-3 py-2 rounded-xl text-sm transition ${
-                          isSelected
-                            ? "bg-yellow-400/10 border border-yellow-400/50 text-white"
+                          isXI
+                            ? "bg-green-900/30 border border-green-600/60 text-white"
+                            : isSub
+                            ? "bg-orange-900/30 border border-orange-600/60 text-white"
                             : "bg-gray-800 border border-transparent text-gray-400 hover:text-white hover:bg-gray-700"
                         } ${alreadyLocked ? "cursor-default" : "cursor-pointer"}`}
                       >
@@ -193,7 +219,8 @@ export default function LockMatchPanel({
                           </span>
                           <span>{player.name}</span>
                         </div>
-                        {isSelected && <span className="text-yellow-400 text-xs">✓ announced</span>}
+                        {isXI && <span className="text-green-400 text-xs font-semibold">✓ XI</span>}
+                        {isSub && <span className="text-orange-400 text-xs font-semibold">⚡ Sub</span>}
                       </button>
                     )
                   })}
@@ -206,16 +233,15 @@ export default function LockMatchPanel({
           {!alreadyLocked && (
             <div className="bg-gray-900 border border-gray-800 rounded-2xl p-5">
               <h3 className="font-semibold text-white mb-1">Step 2 — Mark Announced Players (After Toss)</h3>
-              <p className="text-gray-500 text-sm mb-2">
-                Select 11–15 announced players per team. Friends will see which players are confirmed.
+              <p className="text-gray-500 text-sm mb-1">
+                <span className="text-green-400 font-semibold">1 tap = Playing XI</span> · <span className="text-orange-400 font-semibold">2 taps = Impact Sub</span> · 3 taps = remove
               </p>
               <p className="text-gray-500 text-sm mb-3">
-                {team1Players.length} from {uniqueTeams[0] || match.team1} · {team2Players.length} from {uniqueTeams[1] || match.team2}
+                Mark exactly 11 XI per team. Subs are optional.
               </p>
-              {!isValidXI && selectedXI.size > 0 && (
+              {!isValidXI && (selectedXI.size > 0 || substituteIds.size > 0) && (
                 <p className="text-red-400 text-sm mb-3">
-                  Select 11–15 per team, minimum 22 total.
-                  ({team1Players.length} + {team2Players.length} = {team1Players.length + team2Players.length})
+                  Need exactly 11 XI per team. ({team1XI.length} + {team2XI.length} so far)
                 </p>
               )}
               <button
