@@ -28,7 +28,30 @@
       "Bash(mkdir -p \"/c/Users/Saptadeep Chatterjee/Desktop/FANTASY CRICKET LEAGUE/src/app/api/admin/matches/[id]/scores\")",
       "Bash(mkdir -p \"/c/Users/Saptadeep Chatterjee/Desktop/FANTASY CRICKET LEAGUE/src/app/api/admin/matches/[id]/finalize\")",
       "Bash(mkdir -p \"/c/Users/Saptadeep Chatterjee/Desktop/FANTASY CRICKET LEAGUE/src/app/api/admin/matches/[id]/status\")",
-      "Bash(mkdir -p \"/c/Users/Saptadeep Chatterjee/Desktop/FANTASY CRICKET LEAGUE/src/app/match/[id]\")"
+      "Bash(mkdir -p \"/c/Users/Saptadeep Chatterjee/Desktop/FANTASY CRICKET LEAGUE/src/app/match/[id]\")",
+      "WebFetch(domain:www.dream11.com)",
+      "WebFetch(domain:blitzpools.com)",
+      "Bash(pip install:*)",
+      "Bash(python3 -c \"import reportlab; print\\(''''ok''''\\)\")",
+      "Bash(pip3 install:*)",
+      "Bash(where python:*)",
+      "Bash(where python3:*)",
+      "Bash(where py:*)",
+      "Bash(node -e \"console.log\\(''node ok''\\)\")",
+      "Bash(node -e \"require\\(''''pdfkit''''\\)\")",
+      "Bash(node generate-points-pdf.js)",
+      "Bash(node -e \":*)",
+      "Bash(node gen.js)",
+      "Bash(rm gen.js)",
+      "Bash(npx tsc:*)",
+      "Bash(node -e \"require\\(''''@supabase/supabase-js''''\\)\")",
+      "Bash(node check-match9.js)",
+      "Bash(node check-rabada.js)",
+      "Bash(node check-rabada2.js)",
+      "Bash(gh run:*)",
+      "Bash(rm \"src/app/api/admin/seed-historical/route.ts\")",
+      "Bash(rmdir \"src/app/api/admin/seed-historical\")",
+      "Bash(rm \"src/app/admin/SeedHistoricalButton.tsx\")"
     ]
   }
 }
