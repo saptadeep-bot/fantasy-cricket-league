@@ -39,6 +39,16 @@ export default async function MatchPage({ params }: { params: Promise<{ id: stri
   // Get current user's team
   const myTeam = teams?.find(t => t.user_id === session.user.id)
 
+  // Calculate actual prize pool from entry fee × participants
+  function getEntryFee(matchType: string): number {
+    const type = (matchType || "league").toLowerCase()
+    if (type === "final") return 500
+    if (type === "eliminator" || type === "qualifier" || type.includes("qualifier") || type.includes("eliminator")) return 350
+    return 250
+  }
+  const entryFee = getEntryFee(match.match_type)
+  const prizePool = entryFee * (teams?.length || 0)
+
   return (
     <div className="min-h-screen bg-gray-950">
       <Navbar />
@@ -57,7 +67,10 @@ export default async function MatchPage({ params }: { params: Promise<{ id: stri
           </div>
           <h1 className="text-xl font-bold text-white">{match.team1} vs {match.team2}</h1>
           <p className="text-gray-500 text-sm mt-1">
-            Prize Pool: <span className="text-yellow-400 font-semibold">₹{(match.base_prize || 0) + (match.rollover_added || 0)}</span>
+            {prizePool > 0
+              ? <>Prize Pool: <span className="text-yellow-400 font-semibold">₹{prizePool}</span> <span className="text-gray-600 text-xs">({teams?.length} × ₹{entryFee})</span></>
+              : <span className="text-gray-600">Entry: ₹{entryFee}/person</span>
+            }
           </p>
         </div>
 

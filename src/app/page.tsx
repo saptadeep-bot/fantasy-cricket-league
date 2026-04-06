@@ -62,12 +62,6 @@ export default async function HomePage() {
     .limit(1)
     .single()
 
-  // Fetch real season reserve total
-  const { data: reserveData } = await supabaseAdmin
-    .from("season_reserve")
-    .select("amount")
-  const totalReserve = reserveData?.reduce((sum, r) => sum + (r.amount || 0), 0) || 0
-
   return (
     <div className="min-h-screen bg-gray-950">
       <Navbar />
@@ -246,14 +240,6 @@ export default async function HomePage() {
           </div>
         )}
 
-        {/* Season Reserve Teaser */}
-        <div className="bg-gray-900 rounded-2xl p-4 border border-gray-800 flex items-center justify-between">
-          <div>
-            <p className="text-sm text-gray-400">Season Reserve Pot</p>
-            <p className="text-xs text-gray-600">Awarded to top 2 at season end</p>
-          </div>
-          <span className="text-yellow-400 font-bold text-lg">₹{totalReserve}</span>
-        </div>
       </main>
     </div>
   )
