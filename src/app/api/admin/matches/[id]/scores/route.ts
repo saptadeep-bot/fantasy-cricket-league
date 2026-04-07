@@ -13,12 +13,16 @@ async function fetchAndSaveScores(matchId: string, cricketdataMatchId: string) {
   const data = await res.json()
 
   if (data.status !== "success") {
-    throw new Error(`API error: ${JSON.stringify(data)}`)
+    const reason = data.reason || data.message || "Unknown error"
+    if (reason.toLowerCase().includes("not found")) {
+      throw new Error("Scorecard not available yet. The match may just be starting — try again in a minute.")
+    }
+    throw new Error(`Cricket API error: ${reason}`)
   }
 
   const scorecard = data.data?.scorecard || []
   if (scorecard.length === 0) {
-    throw new Error("No scorecard data returned yet. Match may not have started.")
+    throw new Error("Scorecard is empty. Match may not have started yet — try again shortly.")
   }
 
   const pointsMap = calculateFantasyPoints(scorecard)
