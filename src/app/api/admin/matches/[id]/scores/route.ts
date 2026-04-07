@@ -5,16 +5,76 @@ import { NextRequest, NextResponse } from "next/server"
 
 const CRICKETDATA_API_KEY = process.env.CRICKETDATA_API_KEY!
 
+async function computeAndSave(matchId: string, scorecard: unknown[]) {
+  const pointsMap = calculateFantasyPoints(scorecard)
+  let updated = 0
+  for (const [playerId, pts] of pointsMap.entries()) {
+    const { error } = await supabaseAdmin
+      .from("match_players")
+      .update({ fantasy_points: Math.round(pts.total * 10) / 10, last_updated: new Date().toISOString() })
+      .eq("match_id", matchId)
+      .eq("cricketdata_player_id", playerId)
+    if (!error) updated++
+  }
+  return { updated, total: pointsMap.size }
+}
+
 async function fetchAndSaveScores(matchId: string, cricketdataMatchId: string) {
+  let resolvedId = cricketdataMatchId
+
   const res = await fetch(
-    `https://api.cricapi.com/v1/match_scorecard?apikey=${CRICKETDATA_API_KEY}&id=${cricketdataMatchId}`,
+    `https://api.cricapi.com/v1/match_scorecard?apikey=${CRICKETDATA_API_KEY}&id=${resolvedId}`,
     { cache: "no-store" }
   )
   const data = await res.json()
 
+  // If scorecard not found, the API may have assigned a new ID when match went live.
+  // Auto-correct by searching currentMatches for the right ID.
   if (data.status !== "success") {
-    const reason = data.reason || data.message || "Unknown error"
+    const reason = data.reason || data.message || ""
     if (reason.toLowerCase().includes("not found")) {
+      // Fetch our match's team names to identify it
+      const { data: matchRow } = await supabaseAdmin
+        .from("matches")
+        .select("team1, team2")
+        .eq("id", matchId)
+        .single()
+
+      if (matchRow) {
+        const liveRes = await fetch(
+          `https://api.cricapi.com/v1/currentMatches?apikey=${CRICKETDATA_API_KEY}&offset=0`,
+          { cache: "no-store" }
+        )
+        const liveData = await liveRes.json()
+        const liveMatches: { id: string; name: string; teams: string[] }[] = liveData.data || []
+
+        // Find match by both team names
+        const found = liveMatches.find(m =>
+          m.teams?.some((t: string) => t.toLowerCase().includes(matchRow.team1.split(" ").pop()!.toLowerCase())) &&
+          m.teams?.some((t: string) => t.toLowerCase().includes(matchRow.team2.split(" ").pop()!.toLowerCase()))
+        )
+
+        if (found && found.id !== cricketdataMatchId) {
+          // Save the corrected ID to DB so future fetches work
+          await supabaseAdmin
+            .from("matches")
+            .update({ cricketdata_match_id: found.id })
+            .eq("id", matchId)
+          resolvedId = found.id
+
+          // Retry scorecard with corrected ID
+          const retryRes = await fetch(
+            `https://api.cricapi.com/v1/match_scorecard?apikey=${CRICKETDATA_API_KEY}&id=${resolvedId}`,
+            { cache: "no-store" }
+          )
+          const retryData = await retryRes.json()
+          if (retryData.status === "success") {
+            const scorecard = retryData.data?.scorecard || []
+            if (scorecard.length === 0) throw new Error("Scorecard is empty — match may not have started yet.")
+            return await computeAndSave(matchId, scorecard)
+          }
+        }
+      }
       throw new Error("Scorecard not available yet. The match may just be starting — try again in a minute.")
     }
     throw new Error(`Cricket API error: ${reason}`)
@@ -25,23 +85,7 @@ async function fetchAndSaveScores(matchId: string, cricketdataMatchId: string) {
     throw new Error("Scorecard is empty. Match may not have started yet — try again shortly.")
   }
 
-  const pointsMap = calculateFantasyPoints(scorecard)
-
-  let updated = 0
-  for (const [playerId, pts] of pointsMap.entries()) {
-    const { error } = await supabaseAdmin
-      .from("match_players")
-      .update({
-        fantasy_points: Math.round(pts.total * 10) / 10,
-        last_updated: new Date().toISOString(),
-      })
-      .eq("match_id", matchId)
-      .eq("cricketdata_player_id", playerId)
-
-    if (!error) updated++
-  }
-
-  return { updated, total: pointsMap.size }
+  return await computeAndSave(matchId, scorecard)
 }
 
 // Admin: manual fetch trigger
