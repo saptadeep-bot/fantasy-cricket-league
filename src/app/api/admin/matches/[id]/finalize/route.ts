@@ -146,8 +146,17 @@ export async function POST(req: NextRequest, { params }: { params: Promise<{ id:
     if (participants === 1) {
       // Only 1 player — full refund
       results.push({ match_id: id, user_id: ranked[0].user_id, rank: 1, raw_points: ranked[0].raw_points, final_points: ranked[0].final_points, prize_won: ENTRY_FEE })
+    } else if (participants === 2) {
+      // 2 players — winner takes all
+      const firstPlaceScore = ranked[0].final_points
+      const firstPlacers = ranked.filter(r => r.final_points === firstPlaceScore)
+      const prizePerFirst = Math.round(totalPool / firstPlacers.length)
+      for (const r of ranked) {
+        const prize = firstPlacers.find(f => f.user_id === r.user_id) ? prizePerFirst : 0
+        results.push({ match_id: id, user_id: r.user_id, rank: r.rank, raw_points: r.raw_points, final_points: r.final_points, prize_won: prize })
+      }
     } else {
-      // 2+ players: 65% to 1st, 35% to 2nd
+      // 3+ players: 65% to 1st, 35% to 2nd
       const firstPlaceScore = ranked[0].final_points
       const firstPlacers = ranked.filter(r => r.final_points === firstPlaceScore)
       const nonFirst = ranked.filter(r => r.final_points < firstPlaceScore)

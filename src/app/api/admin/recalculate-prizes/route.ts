@@ -61,6 +61,14 @@ export async function POST() {
 
     if (participants === 1) {
       updated.push({ user_id: existingResults[0].user_id, prize_won: ENTRY_FEE })
+    } else if (participants === 2) {
+      // 2 players — winner takes all
+      const firstPlaceScore = existingResults[0].final_points
+      const firstPlacers = existingResults.filter(r => r.final_points === firstPlaceScore)
+      const prizePerFirst = Math.round(totalPool / firstPlacers.length)
+      for (const r of existingResults) {
+        updated.push({ user_id: r.user_id, prize_won: firstPlacers.find(f => f.user_id === r.user_id) ? prizePerFirst : 0 })
+      }
     } else {
       const firstPlaceScore = existingResults[0].final_points
       const firstPlacers = existingResults.filter(r => r.final_points === firstPlaceScore)
