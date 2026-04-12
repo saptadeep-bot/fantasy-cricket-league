@@ -1,6 +1,26 @@
 "use client"
 import { useState, useEffect, useCallback } from "react"
 
+// Shows "Updated Xm ago" and ticks every 30s — turns red if >10 min stale
+function ScoreAge({ updatedAt }: { updatedAt: Date }) {
+  const [, setTick] = useState(0)
+  useEffect(() => {
+    const t = setInterval(() => setTick(n => n + 1), 30_000)
+    return () => clearInterval(t)
+  }, [])
+
+  const diffMs = Date.now() - updatedAt.getTime()
+  const diffMin = Math.floor(diffMs / 60_000)
+  const label = diffMin < 1 ? "just now" : `${diffMin}m ago`
+  const isStale = diffMin >= 10
+
+  return (
+    <span className={`text-xs ${isStale ? "text-red-400" : "text-gray-500"}`}>
+      {isStale ? "⚠ " : ""}Scores: {label}
+    </span>
+  )
+}
+
 const ROLE_COLORS: Record<string, string> = {
   BAT: "bg-blue-900 text-blue-300",
   BOWL: "bg-red-900 text-red-300",
@@ -87,8 +107,19 @@ export default function LiveMatchView({
 
   const [refreshing, setRefreshing] = useState(false)
   const [refreshError, setRefreshError] = useState<string | null>(null)
+  const [apiLastUpdated, setApiLastUpdated] = useState<Date | null>(null)
 
-  // Auto-poll (uses stale check on server — won't hammer API)
+  // Derive API last-updated time from the player data (when DB was last written by API)
+  useEffect(() => {
+    const timestamps = livePlayers
+      .map(p => p.last_updated ? new Date(p.last_updated).getTime() : 0)
+      .filter(t => t > 0)
+    if (timestamps.length > 0) {
+      setApiLastUpdated(new Date(Math.max(...timestamps)))
+    }
+  }, [livePlayers])
+
+  // Auto-poll: triggers API fetch on server if >90s stale, then returns DB data
   const fetchLiveScores = useCallback(async () => {
     try {
       const res = await fetch(`/api/admin/matches/${match.id}/scores`)
@@ -98,16 +129,16 @@ export default function LiveMatchView({
         setLastUpdated(new Date())
       }
     } catch {
-      // Silently fail on polling errors
+      // Silently fail on auto-poll errors
     }
   }, [match.id])
 
-  // Manual refresh — always fetches fresh from API, surfaces errors
+  // Manual refresh — reads latest from DB instantly (no API call, never fails)
   const manualRefresh = useCallback(async () => {
     setRefreshing(true)
     setRefreshError(null)
     try {
-      const res = await fetch(`/api/admin/matches/${match.id}/scores?force=true`)
+      const res = await fetch(`/api/admin/matches/${match.id}/scores?refresh=1`)
       const data = await res.json()
       if (data.error) {
         setRefreshError(data.error)
@@ -125,7 +156,8 @@ export default function LiveMatchView({
   useEffect(() => {
     if (match.status === "live") {
       fetchLiveScores()
-      const interval = setInterval(fetchLiveScores, 4 * 60 * 1000) // every 4 min
+      // Poll every 90 seconds — server only calls API if data is stale
+      const interval = setInterval(fetchLiveScores, 90 * 1000)
       return () => clearInterval(interval)
     }
   }, [match.status, fetchLiveScores])
@@ -199,17 +231,15 @@ export default function LiveMatchView({
                 {match.status === "live" && (
                   <div className="text-right">
                     <div className="flex items-center gap-2">
-                      {lastUpdated && (
-                        <span className="text-gray-600 text-xs">
-                          {lastUpdated.toLocaleTimeString("en-IN", { timeStyle: "short" })}
-                        </span>
+                      {apiLastUpdated && (
+                        <ScoreAge updatedAt={apiLastUpdated} />
                       )}
                       <button
                         onClick={manualRefresh}
                         disabled={refreshing}
                         className="bg-yellow-400/10 border border-yellow-400/40 text-yellow-400 text-xs font-semibold px-3 py-1 rounded-lg hover:bg-yellow-400/20 transition disabled:opacity-50"
                       >
-                        {refreshing ? "Fetching..." : "↻ Refresh"}
+                        {refreshing ? "Loading…" : "↻ Refresh"}
                       </button>
                     </div>
                     {refreshError && (
