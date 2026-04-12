@@ -107,6 +107,7 @@ export default function LiveMatchView({
 
   const [refreshing, setRefreshing] = useState(false)
   const [refreshError, setRefreshError] = useState<string | null>(null)
+  const [pollError, setPollError] = useState<string | null>(null)
   const [apiLastUpdated, setApiLastUpdated] = useState<Date | null>(null)
 
   // Derive API last-updated time from the player data (when DB was last written by API)
@@ -128,8 +129,14 @@ export default function LiveMatchView({
         setLivePlayers(data.players)
         setLastUpdated(new Date())
       }
+      // Surface API errors from the poll so they're visible
+      if (data.fetchError) {
+        setPollError(data.fetchError)
+      } else {
+        setPollError(null)
+      }
     } catch {
-      // Silently fail on auto-poll errors
+      // Network error — keep retrying silently
     }
   }, [match.id])
 
@@ -244,6 +251,9 @@ export default function LiveMatchView({
                     </div>
                     {refreshError && (
                       <p className="text-red-400 text-xs mt-1">{refreshError}</p>
+                    )}
+                    {pollError && !refreshError && (
+                      <p className="text-orange-400 text-xs mt-1">⚠ {pollError}</p>
                     )}
                   </div>
                 )}

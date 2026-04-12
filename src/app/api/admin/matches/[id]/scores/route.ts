@@ -3,16 +3,16 @@ import { supabaseAdmin } from "@/lib/supabase"
 import { calculateFantasyPoints } from "@/lib/fantasy-points"
 import { NextRequest, NextResponse } from "next/server"
 
-// Give Vercel up to 60 seconds for API calls (instead of default 10s)
+// Give Vercel up to 60 seconds for external API calls
 export const maxDuration = 60
 
 const CRICKETDATA_API_KEY = process.env.CRICKETDATA_API_KEY!
 
 async function computeAndSave(matchId: string, scorecard: unknown[]) {
   const pointsMap = calculateFantasyPoints(scorecard)
-  if (pointsMap.size === 0) return { updated: 0, total: 0, remapped: 0 }
+  if (pointsMap.size === 0) return { updated: 0, total: 0, remapped: 0, missed: [] as string[] }
 
-  // Load current match_players from DB
+  // Load all current match_players from DB in one query
   const { data: dbPlayers } = await supabaseAdmin
     .from("match_players")
     .select("cricketdata_player_id, name")
@@ -21,15 +21,14 @@ async function computeAndSave(matchId: string, scorecard: unknown[]) {
   const nameToDbId = new Map<string, string>()
   const dbIds = new Set<string>()
   for (const p of (dbPlayers || [])) {
-    // Normalize name: lowercase, collapse spaces, strip dots
     const key = p.name.toLowerCase().replace(/\./g, "").replace(/\s+/g, " ").trim()
     nameToDbId.set(key, p.cricketdata_player_id)
     dbIds.add(p.cricketdata_player_id)
   }
 
   const now = new Date().toISOString()
-  const directUpdates: { match_id: string; cricketdata_player_id: string; fantasy_points: number; last_updated: string }[] = []
   const idRemaps: Array<{ oldId: string; newId: string; fantasyPoints: number }> = []
+  const directUpdates: Array<{ id: string; points: number }> = []
   const nameMissed: string[] = []
 
   for (const [playerId, pts] of pointsMap.entries()) {
@@ -37,10 +36,8 @@ async function computeAndSave(matchId: string, scorecard: unknown[]) {
     const normalizedName = pts.name.toLowerCase().replace(/\./g, "").replace(/\s+/g, " ").trim()
 
     if (dbIds.has(playerId)) {
-      // Direct ID match — batch update
-      directUpdates.push({ match_id: matchId, cricketdata_player_id: playerId, fantasy_points: fantasyPoints, last_updated: now })
+      directUpdates.push({ id: playerId, points: fantasyPoints })
     } else {
-      // Try name-based fallback
       const dbId = nameToDbId.get(normalizedName)
       if (dbId) {
         idRemaps.push({ oldId: dbId, newId: playerId, fantasyPoints })
@@ -50,31 +47,30 @@ async function computeAndSave(matchId: string, scorecard: unknown[]) {
     }
   }
 
-  // --- Batch direct updates (single DB round-trip) ---
-  let updated = 0
-  if (directUpdates.length > 0) {
-    // Supabase upsert with on-conflict update
-    const { error } = await supabaseAdmin
-      .from("match_players")
-      .upsert(directUpdates, { onConflict: "match_id,cricketdata_player_id" })
-    if (!error) updated += directUpdates.length
-  }
+  // Run all direct updates in parallel (no unique constraint needed — just WHERE clauses)
+  const directResults = await Promise.all(
+    directUpdates.map(({ id, points }) =>
+      supabaseAdmin
+        .from("match_players")
+        .update({ fantasy_points: points, last_updated: now })
+        .eq("match_id", matchId)
+        .eq("cricketdata_player_id", id)
+    )
+  )
+  const updated = directResults.filter(r => !r.error).length
 
-  // --- Name-based remaps (fix IDs + points in one update per remap) ---
-  for (const remap of idRemaps) {
+  // Name-based remaps: fix the stored player ID AND update points
+  let remapped = 0
+  for (const { oldId, newId, fantasyPoints } of idRemaps) {
     const { error } = await supabaseAdmin
       .from("match_players")
-      .update({
-        cricketdata_player_id: remap.newId,
-        fantasy_points: remap.fantasyPoints,
-        last_updated: now,
-      })
+      .update({ cricketdata_player_id: newId, fantasy_points: fantasyPoints, last_updated: now })
       .eq("match_id", matchId)
-      .eq("cricketdata_player_id", remap.oldId)
-    if (!error) updated++
+      .eq("cricketdata_player_id", oldId)
+    if (!error) remapped++
   }
 
-  // --- Fix team player_ids / captain / vc to use corrected IDs ---
+  // Fix captain/vc/player_ids in teams that referenced remapped IDs
   if (idRemaps.length > 0) {
     const { data: teamsData } = await supabaseAdmin
       .from("teams")
@@ -105,7 +101,7 @@ async function computeAndSave(matchId: string, scorecard: unknown[]) {
     }
   }
 
-  return { updated, total: pointsMap.size, remapped: idRemaps.length, missed: nameMissed }
+  return { updated: updated + remapped, total: pointsMap.size, remapped, missed: nameMissed }
 }
 
 async function fetchAndSaveScores(matchId: string, cricketdataMatchId: string) {
@@ -119,8 +115,9 @@ async function fetchAndSaveScores(matchId: string, cricketdataMatchId: string) {
 
   if (data.status !== "success") {
     const reason = (data.reason || data.message || "").toLowerCase()
+
     if (reason.includes("not found") || reason.includes("invalid")) {
-      // Match ID may have changed when match went live — try auto-correct
+      // Match ID may differ between scheduled and live — auto-correct
       const { data: matchRow } = await supabaseAdmin
         .from("matches")
         .select("team1, team2")
@@ -133,13 +130,13 @@ async function fetchAndSaveScores(matchId: string, cricketdataMatchId: string) {
           { cache: "no-store" }
         )
         const liveData = await liveRes.json()
-        const liveMatches: { id: string; name: string; teams: string[] }[] = liveData.data || []
+        const liveMatches: { id: string; teams: string[] }[] = liveData.data || []
 
-        const t1Last = matchRow.team1.split(" ").pop()!.toLowerCase()
-        const t2Last = matchRow.team2.split(" ").pop()!.toLowerCase()
+        const t1 = matchRow.team1.split(" ").pop()!.toLowerCase()
+        const t2 = matchRow.team2.split(" ").pop()!.toLowerCase()
         const found = liveMatches.find(m =>
-          m.teams?.some((t: string) => t.toLowerCase().includes(t1Last)) &&
-          m.teams?.some((t: string) => t.toLowerCase().includes(t2Last))
+          m.teams?.some((t: string) => t.toLowerCase().includes(t1)) &&
+          m.teams?.some((t: string) => t.toLowerCase().includes(t2))
         )
 
         if (found && found.id !== cricketdataMatchId) {
@@ -156,26 +153,25 @@ async function fetchAndSaveScores(matchId: string, cricketdataMatchId: string) {
           const retryData = await retryRes.json()
           if (retryData.status === "success") {
             const scorecard = retryData.data?.scorecard || []
-            if (scorecard.length === 0) throw new Error("Scorecard empty — match may just be starting.")
+            if (scorecard.length === 0) throw new Error("Scorecard is empty — match may just be starting.")
             return await computeAndSave(matchId, scorecard)
           }
-          throw new Error("Scorecard not available after ID correction. Match may still be starting.")
+          throw new Error("Scorecard unavailable even after ID correction.")
         }
       }
-      throw new Error("Scorecard not available yet. The match may just be starting — try again in a minute.")
+      throw new Error("Scorecard not available yet. Match may still be starting.")
     }
-    throw new Error(`Cricket API error: ${data.reason || data.message || "Unknown error"}`)
+    throw new Error(`Cricket API error: ${data.reason || data.message || "Unknown"}`)
   }
 
   const scorecard = data.data?.scorecard || []
   if (scorecard.length === 0) {
-    throw new Error("Scorecard empty. Match may not have started yet — try again shortly.")
+    throw new Error("Scorecard empty — match may not have started yet.")
   }
 
   return await computeAndSave(matchId, scorecard)
 }
 
-// ─── READ players from DB (shared helper) ───────────────────────────────────
 async function readPlayersFromDb(matchId: string) {
   const { data: players } = await supabaseAdmin
     .from("match_players")
@@ -185,7 +181,7 @@ async function readPlayersFromDb(matchId: string) {
   return players || []
 }
 
-// ─── Admin: force-fetch from API ────────────────────────────────────────────
+// ─── Admin POST: force-fetch from Cricket API ────────────────────────────────
 export async function POST(req: NextRequest, { params }: { params: Promise<{ id: string }> }) {
   const { id } = await params
   const session = await auth()
@@ -206,35 +202,37 @@ export async function POST(req: NextRequest, { params }: { params: Promise<{ id:
     const players = await readPlayersFromDb(id)
     return NextResponse.json({ success: true, players, ...result })
   } catch (err) {
-    return NextResponse.json({ error: String(err).replace(/Error:\s*/g, "") }, { status: 400 })
+    return NextResponse.json({ error: String(err).replace(/^Error:\s*/, "") }, { status: 400 })
   }
 }
 
-// ─── Public GET ─────────────────────────────────────────────────────────────
-// ?refresh=1  → participant pressed "Refresh": always reads DB (fast, no API call)
-// no params   → auto-poll: fetches from API if data is stale, then returns DB data
+// ─── Public GET ──────────────────────────────────────────────────────────────
+// ?refresh=1  → participant pressed Refresh: reads DB only (always fast)
+// ?force=true → legacy alias for ?refresh=1
+// (no params) → auto-poll: fetches from API when stale, then returns DB data
 export async function GET(req: NextRequest, { params }: { params: Promise<{ id: string }> }) {
   const { id } = await params
   const session = await auth()
   if (!session) return NextResponse.json({ error: "Unauthorized" }, { status: 401 })
 
   const url = new URL(req.url)
-  const isParticipantRefresh = url.searchParams.get("refresh") === "1"
-  // Legacy ?force=true also treated as participant refresh (DB read only)
-  const isForce = url.searchParams.get("force") === "true"
+  const isParticipantRefresh =
+    url.searchParams.get("refresh") === "1" || url.searchParams.get("force") === "true"
 
-  if (isParticipantRefresh || isForce) {
-    // Just read the latest from DB — always fast, always works
+  if (isParticipantRefresh) {
+    // Instant DB read — no external API call, never times out
     const players = await readPlayersFromDb(id)
     return NextResponse.json({ players })
   }
 
-  // Auto-poll path: fetch from API if data is stale (>90 seconds)
+  // Auto-poll path: fetch from API if data is >90 seconds stale
   const { data: match } = await supabaseAdmin
     .from("matches")
     .select("status, cricketdata_match_id")
     .eq("id", id)
     .single()
+
+  let fetchError: string | null = null
 
   if (match?.status === "live" && match?.cricketdata_match_id) {
     const { data: lastPlayer } = await supabaseAdmin
@@ -247,18 +245,18 @@ export async function GET(req: NextRequest, { params }: { params: Promise<{ id: 
       .single()
 
     const lastUpdated = lastPlayer?.last_updated ? new Date(lastPlayer.last_updated) : null
-    const ninetySecondsAgo = new Date(Date.now() - 90 * 1000)
-    const isStale = !lastUpdated || lastUpdated < ninetySecondsAgo
+    const isStale = !lastUpdated || lastUpdated < new Date(Date.now() - 90_000)
 
     if (isStale) {
       try {
         await fetchAndSaveScores(id, match.cricketdata_match_id)
-      } catch {
-        // Silently fail — return whatever is in the DB
+      } catch (err) {
+        // Capture the error so the client can display it
+        fetchError = String(err).replace(/^Error:\s*/, "")
       }
     }
   }
 
   const players = await readPlayersFromDb(id)
-  return NextResponse.json({ players })
+  return NextResponse.json({ players, ...(fetchError ? { fetchError } : {}) })
 }
