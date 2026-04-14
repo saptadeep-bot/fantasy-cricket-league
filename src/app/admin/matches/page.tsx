@@ -13,6 +13,7 @@ export default async function AdminMatchesPage() {
     .from("matches")
     .select("*")
     .not("status", "eq", "completed")
+    .not("status", "eq", "abandoned")
     .order("scheduled_at", { ascending: true })
 
   return (
