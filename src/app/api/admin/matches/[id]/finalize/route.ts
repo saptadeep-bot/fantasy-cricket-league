@@ -1,6 +1,7 @@
 import { auth } from "@/auth"
 import { supabaseAdmin } from "@/lib/supabase"
 import { calculateFantasyPoints } from "@/lib/fantasy-points"
+import { getEntryFee, calcPrizes } from "@/lib/prizes"
 import { NextRequest, NextResponse } from "next/server"
 
 const CRICKETDATA_API_KEY = process.env.CRICKETDATA_API_KEY!
@@ -126,65 +127,13 @@ export async function POST(req: NextRequest, { params }: { params: Promise<{ id:
       currentRank++
     }
 
-    // Step 6: Calculate prizes — entry fee depends on match type, 65/35 split
-    const matchType = (match.match_type || "league").toLowerCase()
-    const ENTRY_FEE = matchType === "final" ? 500
-      : (matchType === "eliminator" || matchType === "qualifier" || matchType.includes("qualifier") || matchType.includes("eliminator")) ? 350
-      : 250 // league
+    // Step 6: Calculate prizes
+    const ENTRY_FEE = getEntryFee(match.match_type)
     const participants = teams.length
     const totalPool = ENTRY_FEE * participants
 
-    const results: Array<{
-      match_id: string
-      user_id: string
-      rank: number
-      raw_points: number
-      final_points: number
-      prize_won: number
-    }> = []
-
-    if (participants === 1) {
-      // Only 1 player — full refund
-      results.push({ match_id: id, user_id: ranked[0].user_id, rank: 1, raw_points: ranked[0].raw_points, final_points: ranked[0].final_points, prize_won: ENTRY_FEE })
-    } else if (participants === 2) {
-      // 2 players — winner takes all
-      const firstPlaceScore = ranked[0].final_points
-      const firstPlacers = ranked.filter(r => r.final_points === firstPlaceScore)
-      const prizePerFirst = Math.round(totalPool / firstPlacers.length)
-      for (const r of ranked) {
-        const prize = firstPlacers.find(f => f.user_id === r.user_id) ? prizePerFirst : 0
-        results.push({ match_id: id, user_id: r.user_id, rank: r.rank, raw_points: r.raw_points, final_points: r.final_points, prize_won: prize })
-      }
-    } else {
-      // 3+ players: 65% to 1st, 35% to 2nd
-      const firstPlaceScore = ranked[0].final_points
-      const firstPlacers = ranked.filter(r => r.final_points === firstPlaceScore)
-      const nonFirst = ranked.filter(r => r.final_points < firstPlaceScore)
-      const secondPlacers = nonFirst.length > 0
-        ? nonFirst.filter(r => r.final_points === nonFirst[0].final_points)
-        : []
-
-      // If everyone ties for 1st, split pool equally
-      const firstPrize = secondPlacers.length === 0 ? totalPool : Math.round(totalPool * 0.65)
-      const secondPrize = secondPlacers.length > 0 ? totalPool - firstPrize : 0
-
-      const prizePerFirst = Math.round(firstPrize / firstPlacers.length)
-      const prizePerSecond = secondPlacers.length > 0 ? Math.round(secondPrize / secondPlacers.length) : 0
-
-      for (const r of ranked) {
-        let prize = 0
-        if (firstPlacers.find(f => f.user_id === r.user_id)) prize = prizePerFirst
-        else if (secondPlacers.find(s => s.user_id === r.user_id)) prize = prizePerSecond
-        results.push({
-          match_id: id,
-          user_id: r.user_id,
-          rank: r.rank,
-          raw_points: r.raw_points,
-          final_points: r.final_points,
-          prize_won: prize,
-        })
-      }
-    }
+    const prizeResults = calcPrizes(ranked, totalPool, ENTRY_FEE)
+    const results = prizeResults.map(r => ({ ...r, match_id: id }))
 
     // Step 7: Save results
     await supabaseAdmin.from("match_results").delete().eq("match_id", id)
