@@ -3,51 +3,78 @@ import { supabaseAdmin } from "@/lib/supabase"
 import { calculateFantasyPoints } from "@/lib/fantasy-points"
 import { NextRequest, NextResponse } from "next/server"
 
-// Give Vercel up to 60 seconds for external API calls
 export const maxDuration = 60
 
 const CRICKETDATA_API_KEY = process.env.CRICKETDATA_API_KEY!
 
+// ─── Name matching ────────────────────────────────────────────────────────────
+// Cricapi uses abbreviated names in scorecards ("V Kohli") but full names in
+// squad ("Virat Kohli"). We need fuzzy matching to link them.
+function norm(s: string) {
+  return s.toLowerCase().replace(/\./g, "").replace(/\s+/g, " ").trim()
+}
+
+function namesMatch(a: string, b: string): boolean {
+  const na = norm(a)
+  const nb = norm(b)
+  if (na === nb) return true
+
+  const pa = na.split(" ")
+  const pb = nb.split(" ")
+
+  // Last word (surname) must match exactly
+  if (pa[pa.length - 1] !== pb[pb.length - 1]) return false
+
+  const fa = pa[0]
+  const fb = pb[0]
+
+  // First names match, or one is just the initial of the other
+  if (fa === fb) return true
+  if (fa.length === 1 && fb.startsWith(fa)) return true
+  if (fb.length === 1 && fa.startsWith(fb)) return true
+
+  return false
+}
+
+// ─── computeAndSave ───────────────────────────────────────────────────────────
 async function computeAndSave(matchId: string, scorecard: unknown[]) {
   const pointsMap = calculateFantasyPoints(scorecard)
   if (pointsMap.size === 0) return { updated: 0, total: 0, remapped: 0, missed: [] as string[] }
 
-  // Load all current match_players from DB in one query
   const { data: dbPlayers } = await supabaseAdmin
     .from("match_players")
     .select("cricketdata_player_id, name")
     .eq("match_id", matchId)
 
-  const nameToDbId = new Map<string, string>()
-  const dbIds = new Set<string>()
-  for (const p of (dbPlayers || [])) {
-    const key = p.name.toLowerCase().replace(/\./g, "").replace(/\s+/g, " ").trim()
-    nameToDbId.set(key, p.cricketdata_player_id)
-    dbIds.add(p.cricketdata_player_id)
-  }
+  const dbList = (dbPlayers || []).map(p => ({
+    id: p.cricketdata_player_id,
+    name: p.name,
+  }))
+  const dbIds = new Set(dbList.map(p => p.id))
 
   const now = new Date().toISOString()
-  const idRemaps: Array<{ oldId: string; newId: string; fantasyPoints: number }> = []
   const directUpdates: Array<{ id: string; points: number }> = []
+  const idRemaps: Array<{ oldId: string; newId: string; fantasyPoints: number }> = []
   const nameMissed: string[] = []
 
   for (const [playerId, pts] of pointsMap.entries()) {
     const fantasyPoints = Math.round(pts.total * 10) / 10
-    const normalizedName = pts.name.toLowerCase().replace(/\./g, "").replace(/\s+/g, " ").trim()
 
     if (dbIds.has(playerId)) {
+      // Perfect ID match — direct update
       directUpdates.push({ id: playerId, points: fantasyPoints })
     } else {
-      const dbId = nameToDbId.get(normalizedName)
-      if (dbId) {
-        idRemaps.push({ oldId: dbId, newId: playerId, fantasyPoints })
+      // Try fuzzy name match (handles "V Kohli" ↔ "Virat Kohli" etc.)
+      const match = dbList.find(p => namesMatch(pts.name, p.name))
+      if (match) {
+        idRemaps.push({ oldId: match.id, newId: playerId, fantasyPoints })
       } else {
         nameMissed.push(pts.name)
       }
     }
   }
 
-  // Run all direct updates in parallel (no unique constraint needed — just WHERE clauses)
+  // Parallel direct updates
   const directResults = await Promise.all(
     directUpdates.map(({ id, points }) =>
       supabaseAdmin
@@ -59,7 +86,7 @@ async function computeAndSave(matchId: string, scorecard: unknown[]) {
   )
   const updated = directResults.filter(r => !r.error).length
 
-  // Name-based remaps: fix the stored player ID AND update points
+  // Name-based remaps: correct stored ID and save points
   let remapped = 0
   for (const { oldId, newId, fantasyPoints } of idRemaps) {
     const { error } = await supabaseAdmin
@@ -70,7 +97,7 @@ async function computeAndSave(matchId: string, scorecard: unknown[]) {
     if (!error) remapped++
   }
 
-  // Fix captain/vc/player_ids in teams that referenced remapped IDs
+  // Repair team player_ids / captain / vc that used old IDs
   if (idRemaps.length > 0) {
     const { data: teamsData } = await supabaseAdmin
       .from("teams")
@@ -85,7 +112,7 @@ async function computeAndSave(matchId: string, scorecard: unknown[]) {
 
       for (const { oldId, newId } of idRemaps) {
         if (playerIds.includes(oldId)) {
-          playerIds = playerIds.map(pid => pid === oldId ? newId : pid)
+          playerIds = playerIds.map(pid => (pid === oldId ? newId : pid))
           changed = true
         }
         if (captainId === oldId) { captainId = newId; changed = true }
@@ -104,53 +131,52 @@ async function computeAndSave(matchId: string, scorecard: unknown[]) {
   return { updated: updated + remapped, total: pointsMap.size, remapped, missed: nameMissed }
 }
 
-/** Try to fetch scorecard for a given ID, returns scorecard array or null */
+// ─── Scorecard fetch helpers ──────────────────────────────────────────────────
 async function tryScorecard(id: string): Promise<unknown[] | null> {
-  const res = await fetch(
-    `https://api.cricapi.com/v1/match_scorecard?apikey=${CRICKETDATA_API_KEY}&id=${id}`,
-    { cache: "no-store" }
-  )
-  const data = await res.json()
-  if (data.status === "success") {
-    const sc = data.data?.scorecard || []
-    return sc.length > 0 ? sc : null
+  try {
+    const res = await fetch(
+      `https://api.cricapi.com/v1/match_scorecard?apikey=${CRICKETDATA_API_KEY}&id=${id}`,
+      { cache: "no-store" }
+    )
+    const data = await res.json()
+    if (data.status === "success") {
+      const sc = data.data?.scorecard ?? []
+      return sc.length > 0 ? sc : null
+    }
+  } catch {
+    // network error — treat as no data
   }
   return null
 }
 
-/** Search currentMatches for our match by team names, trying multiple word strategies */
-async function findLiveMatchId(team1: string, team2: string, excludeId: string): Promise<string | null> {
-  // Fetch up to two pages of current matches
-  const pages = await Promise.all([
-    fetch(`https://api.cricapi.com/v1/currentMatches?apikey=${CRICKETDATA_API_KEY}&offset=0`, { cache: "no-store" }).then(r => r.json()),
-    fetch(`https://api.cricapi.com/v1/currentMatches?apikey=${CRICKETDATA_API_KEY}&offset=25`, { cache: "no-store" }).then(r => r.json()),
+async function findLiveMatchId(team1: string, team2: string): Promise<string | null> {
+  // Fetch two pages of currentMatches in parallel (covers up to 50 matches)
+  const [p0, p1] = await Promise.all([
+    fetch(`https://api.cricapi.com/v1/currentMatches?apikey=${CRICKETDATA_API_KEY}&offset=0`, { cache: "no-store" }).then(r => r.json()).catch(() => ({})),
+    fetch(`https://api.cricapi.com/v1/currentMatches?apikey=${CRICKETDATA_API_KEY}&offset=25`, { cache: "no-store" }).then(r => r.json()).catch(() => ({})),
   ])
 
-  const liveMatches: { id: string; name: string; teams?: string[] }[] = [
-    ...(pages[0].data || []),
-    ...(pages[1].data || []),
+  const liveMatches: { id: string; name?: string; teams?: string[] }[] = [
+    ...(p0.data || []),
+    ...(p1.data || []),
   ]
 
-  // Build word lists for each team — last word, first word, and full name
-  const words1 = [
-    team1.split(" ").pop()!,
-    team1.split(" ")[0],
-    team1,
-  ].map(w => w.toLowerCase())
+  // Build multiple name tokens for each team to maximise match chance
+  const tokens = (name: string) => [
+    name.toLowerCase(),
+    name.split(" ").pop()!.toLowerCase(),   // last word  e.g. "Indians"
+    name.split(" ")[0].toLowerCase(),        // first word e.g. "Mumbai"
+  ]
 
-  const words2 = [
-    team2.split(" ").pop()!,
-    team2.split(" ")[0],
-    team2,
-  ].map(w => w.toLowerCase())
+  const t1 = tokens(team1)
+  const t2 = tokens(team2)
 
-  const matchesTeam = (haystack: string, words: string[]) =>
-    words.some(w => haystack.toLowerCase().includes(w))
+  const hits = (haystack: string, toks: string[]) =>
+    toks.some(t => haystack.toLowerCase().includes(t))
 
   const found = liveMatches.find(m => {
-    if (m.id === excludeId) return false
-    const teamStr = (m.teams || []).join(" ") + " " + (m.name || "")
-    return matchesTeam(teamStr, words1) && matchesTeam(teamStr, words2)
+    const haystack = [...(m.teams || []), m.name || ""].join(" ")
+    return hits(haystack, t1) && hits(haystack, t2)
   })
 
   return found?.id ?? null
@@ -160,7 +186,7 @@ async function fetchAndSaveScores(matchId: string, cricketdataMatchId: string) {
   // Step 1: try the stored ID
   let scorecard = await tryScorecard(cricketdataMatchId)
 
-  // Step 2: if that failed (error or empty), search currentMatches for the real live ID
+  // Step 2: if no scorecard, search currentMatches for the correct live ID
   if (!scorecard) {
     const { data: matchRow } = await supabaseAdmin
       .from("matches")
@@ -169,37 +195,39 @@ async function fetchAndSaveScores(matchId: string, cricketdataMatchId: string) {
       .single()
 
     if (matchRow) {
-      const newId = await findLiveMatchId(matchRow.team1, matchRow.team2, cricketdataMatchId)
+      const foundId = await findLiveMatchId(matchRow.team1, matchRow.team2)
 
-      if (newId) {
-        // Persist the corrected ID so future calls work immediately
-        await supabaseAdmin
-          .from("matches")
-          .update({ cricketdata_match_id: newId })
-          .eq("id", matchId)
-
-        scorecard = await tryScorecard(newId)
+      if (foundId) {
+        // Always persist whatever ID we found (even if same — confirms it's current)
+        if (foundId !== cricketdataMatchId) {
+          await supabaseAdmin
+            .from("matches")
+            .update({ cricketdata_match_id: foundId })
+            .eq("id", matchId)
+        }
+        scorecard = await tryScorecard(foundId)
       }
     }
   }
 
   if (!scorecard) {
-    throw new Error("Scorecard not available yet — match may still be starting or API ID mismatch. Try again in a minute.")
+    throw new Error("Scorecard not available yet — try again in a moment.")
   }
 
   return await computeAndSave(matchId, scorecard)
 }
 
+// ─── DB read helper ───────────────────────────────────────────────────────────
 async function readPlayersFromDb(matchId: string) {
-  const { data: players } = await supabaseAdmin
+  const { data } = await supabaseAdmin
     .from("match_players")
     .select("cricketdata_player_id, name, team, role, fantasy_points, last_updated")
     .eq("match_id", matchId)
     .order("fantasy_points", { ascending: false })
-  return players || []
+  return data || []
 }
 
-// ─── Admin POST: force-fetch from Cricket API ────────────────────────────────
+// ─── Admin POST: force-fetch ──────────────────────────────────────────────────
 export async function POST(req: NextRequest, { params }: { params: Promise<{ id: string }> }) {
   const { id } = await params
   const session = await auth()
@@ -224,10 +252,9 @@ export async function POST(req: NextRequest, { params }: { params: Promise<{ id:
   }
 }
 
-// ─── Public GET ──────────────────────────────────────────────────────────────
-// ?refresh=1  → participant pressed Refresh: reads DB only (always fast)
-// ?force=true → legacy alias for ?refresh=1
-// (no params) → auto-poll: fetches from API when stale, then returns DB data
+// ─── Public GET ───────────────────────────────────────────────────────────────
+// ?refresh=1 / ?force=true → instant DB read (participant Refresh button)
+// (no params) → auto-poll: fetch from API if stale, return DB data
 export async function GET(req: NextRequest, { params }: { params: Promise<{ id: string }> }) {
   const { id } = await params
   const session = await auth()
@@ -238,12 +265,11 @@ export async function GET(req: NextRequest, { params }: { params: Promise<{ id: 
     url.searchParams.get("refresh") === "1" || url.searchParams.get("force") === "true"
 
   if (isParticipantRefresh) {
-    // Instant DB read — no external API call, never times out
     const players = await readPlayersFromDb(id)
     return NextResponse.json({ players })
   }
 
-  // Auto-poll path: fetch from API if data is >90 seconds stale
+  // Auto-poll: fetch from API if data is >90 seconds stale
   const { data: match } = await supabaseAdmin
     .from("matches")
     .select("status, cricketdata_match_id")
@@ -269,12 +295,18 @@ export async function GET(req: NextRequest, { params }: { params: Promise<{ id: 
       try {
         await fetchAndSaveScores(id, match.cricketdata_match_id)
       } catch (err) {
-        // Capture the error so the client can display it
         fetchError = String(err).replace(/^Error:\s*/, "")
       }
     }
   }
 
   const players = await readPlayersFromDb(id)
-  return NextResponse.json({ players, ...(fetchError ? { fetchError } : {}) })
+
+  // Only surface API errors when there are no scores yet — once scores are
+  // showing, a transient API blip shouldn't alarm participants
+  const hasScores = players.some(p => (p.fantasy_points || 0) > 0)
+  return NextResponse.json({
+    players,
+    ...(fetchError && !hasScores ? { fetchError } : {}),
+  })
 }
