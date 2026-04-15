@@ -68,24 +68,27 @@ interface Match {
 
 export default function LiveMatchView({
   match,
-  teams,
+  teams: initialTeams,
   players,
   results,
-  myTeam,
   currentUserId,
 }: {
   match: Match
   teams: Team[]
   players: Player[]
   results: Result[]
-  myTeam: Team | null
+  myTeam: Team | null   // kept for API compat, derived from liveTeams below
   currentUserId: string
 }) {
   const [livePlayers, setLivePlayers] = useState<Player[]>(players)
+  const [liveTeams, setLiveTeams] = useState<Team[]>(initialTeams)
   const [lastUpdated, setLastUpdated] = useState<Date | null>(null)
   const [activeTab, setActiveTab] = useState<"scores" | "myteam" | "allteams">("scores")
 
-  // Build points map for quick lookup
+  // Always derive myTeam from live teams state so it updates when IDs change
+  const myTeam = liveTeams.find(t => t.user_id === currentUserId) || null
+
+  // Build points map from live player data
   const pointsMap = Object.fromEntries(
     livePlayers.map(p => [p.cricketdata_player_id, p.fantasy_points || 0])
   )
@@ -101,7 +104,7 @@ export default function LiveMatchView({
   }
 
   // Sort teams by live score
-  const rankedTeams = [...teams]
+  const rankedTeams = [...liveTeams]
     .map(t => ({ ...t, liveScore: Math.round(computeTeamScore(t) * 10) / 10 }))
     .sort((a, b) => b.liveScore - a.liveScore)
 
@@ -129,7 +132,7 @@ export default function LiveMatchView({
         setLivePlayers(data.players)
         setLastUpdated(new Date())
       }
-      // Surface API errors from the poll so they're visible
+      if (data.teams) setLiveTeams(data.teams)
       if (data.fetchError) {
         setPollError(data.fetchError)
       } else {
@@ -149,8 +152,9 @@ export default function LiveMatchView({
       const data = await res.json()
       if (data.error) {
         setRefreshError(data.error)
-      } else if (data.players) {
-        setLivePlayers(data.players)
+      } else {
+        if (data.players) setLivePlayers(data.players)
+        if (data.teams) setLiveTeams(data.teams)
         setLastUpdated(new Date())
       }
     } catch {

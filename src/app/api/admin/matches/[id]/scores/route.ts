@@ -8,8 +8,8 @@ export const maxDuration = 60
 const CRICKETDATA_API_KEY = process.env.CRICKETDATA_API_KEY!
 
 // ─── Name matching ────────────────────────────────────────────────────────────
-// Cricapi uses abbreviated names in scorecards ("V Kohli") but full names in
-// squad ("Virat Kohli"). We need fuzzy matching to link them.
+// Cricapi can return names in many formats: "V Kohli", "RG Sharma", "MS Dhoni",
+// "Virat Kohli", "Rohit Sharma". We need to match all these to DB names.
 function norm(s: string) {
   return s.toLowerCase().replace(/\./g, "").replace(/\s+/g, " ").trim()
 }
@@ -22,16 +22,22 @@ function namesMatch(a: string, b: string): boolean {
   const pa = na.split(" ")
   const pb = nb.split(" ")
 
-  // Last word (surname) must match exactly
+  // Surname (last word) must match
   if (pa[pa.length - 1] !== pb[pb.length - 1]) return false
 
-  const fa = pa[0]
-  const fb = pb[0]
+  const fa = pa[0]  // first part of name A
+  const fb = pb[0]  // first part of name B
 
-  // First names match, or one is just the initial of the other
   if (fa === fb) return true
+
+  // Single initial: "v" matches "virat"
   if (fa.length === 1 && fb.startsWith(fa)) return true
   if (fb.length === 1 && fa.startsWith(fb)) return true
+
+  // Double/triple initials: "rg" or "ms" — just check first letter matches
+  // e.g. "ms" (MS Dhoni) matches "mahendra" — same first letter
+  if (fa.length <= 3 && fb.length > 3 && fa[0] === fb[0]) return true
+  if (fb.length <= 3 && fa.length > 3 && fb[0] === fa[0]) return true
 
   return false
 }
@@ -217,13 +223,21 @@ async function fetchAndSaveScores(matchId: string, cricketdataMatchId: string) {
   return await computeAndSave(matchId, scorecard)
 }
 
-// ─── DB read helper ───────────────────────────────────────────────────────────
+// ─── DB read helpers ──────────────────────────────────────────────────────────
 async function readPlayersFromDb(matchId: string) {
   const { data } = await supabaseAdmin
     .from("match_players")
     .select("cricketdata_player_id, name, team, role, fantasy_points, last_updated")
     .eq("match_id", matchId)
     .order("fantasy_points", { ascending: false })
+  return data || []
+}
+
+async function readTeamsFromDb(matchId: string) {
+  const { data } = await supabaseAdmin
+    .from("teams")
+    .select("id, user_id, player_ids, captain_id, vice_captain_id, users(id, name)")
+    .eq("match_id", matchId)
   return data || []
 }
 
@@ -265,8 +279,8 @@ export async function GET(req: NextRequest, { params }: { params: Promise<{ id: 
     url.searchParams.get("refresh") === "1" || url.searchParams.get("force") === "true"
 
   if (isParticipantRefresh) {
-    const players = await readPlayersFromDb(id)
-    return NextResponse.json({ players })
+    const [players, teams] = await Promise.all([readPlayersFromDb(id), readTeamsFromDb(id)])
+    return NextResponse.json({ players, teams })
   }
 
   // Auto-poll: fetch from API if data is >90 seconds stale
@@ -300,13 +314,13 @@ export async function GET(req: NextRequest, { params }: { params: Promise<{ id: 
     }
   }
 
-  const players = await readPlayersFromDb(id)
+  const [players, teams] = await Promise.all([readPlayersFromDb(id), readTeamsFromDb(id)])
 
-  // Only surface API errors when there are no scores yet — once scores are
-  // showing, a transient API blip shouldn't alarm participants
+  // Only surface API errors when there are no scores yet
   const hasScores = players.some(p => (p.fantasy_points || 0) > 0)
   return NextResponse.json({
     players,
+    teams,
     ...(fetchError && !hasScores ? { fetchError } : {}),
   })
 }
