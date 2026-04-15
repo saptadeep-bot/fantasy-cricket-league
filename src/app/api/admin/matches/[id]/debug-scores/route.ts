@@ -1,9 +1,17 @@
 import { auth } from "@/auth"
 import { supabaseAdmin } from "@/lib/supabase"
-import { calculateFantasyPoints } from "@/lib/fantasy-points"
 import { NextRequest, NextResponse } from "next/server"
 
 const CRICKETDATA_API_KEY = process.env.CRICKETDATA_API_KEY!
+
+async function fetchJson(url: string) {
+  try {
+    const r = await fetch(url, { cache: "no-store" })
+    return await r.json()
+  } catch (e) {
+    return { error: String(e) }
+  }
+}
 
 export async function GET(req: NextRequest, { params }: { params: Promise<{ id: string }> }) {
   const { id } = await params
@@ -18,59 +26,66 @@ export async function GET(req: NextRequest, { params }: { params: Promise<{ id: 
 
   if (!match) return NextResponse.json({ error: "Match not found" }, { status: 404 })
 
-  // Fetch scorecard from API
-  const scRes = await fetch(
-    `https://api.cricapi.com/v1/match_scorecard?apikey=${CRICKETDATA_API_KEY}&id=${match.cricketdata_match_id}`,
-    { cache: "no-store" }
-  )
-  const scData = await scRes.json()
+  const mid = match.cricketdata_match_id
+  const KEY = `apikey=${CRICKETDATA_API_KEY}`
 
-  const scorecard = scData.data?.scorecard ?? []
-  const pointsMap = scorecard.length > 0 ? calculateFantasyPoints(scorecard) : new Map()
+  // Try every relevant cricapi endpoint in parallel
+  const [scorecard, matchInfo, currentMatches] = await Promise.all([
+    fetchJson(`https://api.cricapi.com/v1/match_scorecard?${KEY}&id=${mid}`),
+    fetchJson(`https://api.cricapi.com/v1/match_info?${KEY}&id=${mid}`),
+    fetchJson(`https://api.cricapi.com/v1/currentMatches?${KEY}&offset=0`),
+  ])
 
-  // Players from DB
-  const { data: dbPlayers } = await supabaseAdmin
-    .from("match_players")
-    .select("cricketdata_player_id, name, fantasy_points")
-    .eq("match_id", id)
+  // Try series_info if we have a series_id
+  const seriesId = matchInfo?.data?.series_id
+  const seriesInfo = seriesId
+    ? await fetchJson(`https://api.cricapi.com/v1/series_info?${KEY}&id=${seriesId}`)
+    : null
 
-  // Show name matching result
-  const norm = (s: string) => s.toLowerCase().replace(/\./g, "").replace(/\s+/g, " ").trim()
-  const namesMatch = (a: string, b: string) => {
-    const na = norm(a); const nb = norm(b)
-    if (na === nb) return true
-    const pa = na.split(" "); const pb = nb.split(" ")
-    if (pa[pa.length - 1] !== pb[pb.length - 1]) return false
-    const fa = pa[0]; const fb = pb[0]
-    if (fa === fb) return true
-    if (fa.length === 1 && fb.startsWith(fa)) return true
-    if (fb.length === 1 && fa.startsWith(fb)) return true
-    if (fa.length <= 3 && fa[0] === fb[0]) return true
-    if (fb.length <= 3 && fb[0] === fa[0]) return true
-    return false
-  }
-
-  const dbIds = new Set((dbPlayers || []).map(p => p.cricketdata_player_id))
-  const matchResults = []
-  for (const [pid, pts] of pointsMap.entries()) {
-    const directMatch = dbIds.has(pid)
-    const nameMatch = directMatch ? null : (dbPlayers || []).find(p => namesMatch(pts.name, p.name))
-    matchResults.push({
-      scorecardName: pts.name,
-      scorecardId: pid,
-      points: Math.round(pts.total * 10) / 10,
-      matchType: directMatch ? "ID_MATCH" : nameMatch ? `NAME_MATCH → ${nameMatch.name}` : "NO_MATCH",
-    })
-  }
+  // Find our match in currentMatches to see full live data structure
+  const liveMatch = (currentMatches?.data || []).find((m: { id: string }) => m.id === mid)
 
   return NextResponse.json({
-    match: { name: match.name, status: match.status, apiId: match.cricketdata_match_id },
-    apiStatus: scData.status,
-    apiReason: scData.reason || scData.message || null,
-    scorecardInnings: scorecard.length,
-    pointsMapSize: pointsMap.size,
-    dbPlayerCount: (dbPlayers || []).length,
-    matching: matchResults,
-    scorecardRaw: scorecard.length > 0 ? scorecard[0] : null, // first innings sample
+    storedMatchId: mid,
+    matchName: match.name,
+
+    // What each endpoint returns
+    endpoints: {
+      match_scorecard: {
+        status: scorecard?.status,
+        reason: scorecard?.reason || scorecard?.message,
+        hasScorecard: Array.isArray(scorecard?.data?.scorecard),
+        scorecardLength: scorecard?.data?.scorecard?.length ?? 0,
+        dataKeys: scorecard?.data ? Object.keys(scorecard.data) : null,
+      },
+      match_info: {
+        status: matchInfo?.status,
+        fantasyEnabled: matchInfo?.data?.fantasyEnabled,
+        bbbEnabled: matchInfo?.data?.bbbEnabled,
+        matchStarted: matchInfo?.data?.matchStarted,
+        matchEnded: matchInfo?.data?.matchEnded,
+        score: matchInfo?.data?.score,
+        series_id: seriesId,
+        dataKeys: matchInfo?.data ? Object.keys(matchInfo.data) : null,
+      },
+      currentMatches_liveEntry: liveMatch
+        ? {
+            id: liveMatch.id,
+            name: liveMatch.name,
+            status: liveMatch.status,
+            score: liveMatch.score,
+            fantasyEnabled: liveMatch.fantasyEnabled,
+            bbbEnabled: liveMatch.bbbEnabled,
+            dataKeys: Object.keys(liveMatch),
+          }
+        : "NOT FOUND in currentMatches",
+      series_info: seriesInfo
+        ? {
+            status: seriesInfo?.status,
+            dataKeys: seriesInfo?.data ? Object.keys(seriesInfo.data) : null,
+            matchCount: seriesInfo?.data?.matchList?.length ?? seriesInfo?.data?.matches?.length ?? "unknown",
+          }
+        : "skipped (no series_id)",
+    },
   })
 }
