@@ -5,6 +5,7 @@ import { useRouter } from "next/navigation"
 interface Match {
   id: string
   status: string
+  cricketdata_match_id?: string
   result_announcement?: string
 }
 
@@ -13,6 +14,7 @@ export default function ScoreControls({ match }: { match: Match }) {
   const [loading, setLoading] = useState<string | null>(null)
   const [message, setMessage] = useState<string | null>(null)
   const [announcement, setAnnouncement] = useState(match.result_announcement || "")
+  const [newMatchId, setNewMatchId] = useState("")
 
   async function callApi(endpoint: string, body?: object) {
     const res = await fetch(endpoint, {
@@ -37,6 +39,22 @@ export default function ScoreControls({ match }: { match: Match }) {
     setMessage(null)
     const data = await callApi(`/api/admin/matches/${match.id}/scores`)
     setMessage(data.success ? `Updated ${data.updated}/${data.total} player scores` : `Error: ${data.error}`)
+    setLoading(null)
+    router.refresh()
+  }
+
+  async function fixMatchId() {
+    const id = newMatchId.trim()
+    if (!id) return
+    setLoading("fixid")
+    setMessage(null)
+    const data = await callApi(`/api/admin/debug-live`, { matchId: match.id, newCricketdataId: id })
+    if (data.success) {
+      setMessage(`Match ID updated. Now press "Fetch Scores Now".`)
+      setNewMatchId("")
+    } else {
+      setMessage(`Error: ${data.error}`)
+    }
     setLoading(null)
     router.refresh()
   }
@@ -102,6 +120,30 @@ export default function ScoreControls({ match }: { match: Match }) {
           </button>
         )}
       </div>
+
+      {/* Fix API Match ID — use if scores say "not available" */}
+      {(match.status === "live" || match.status === "locked") && (
+        <div>
+          <label className="text-gray-400 text-xs block mb-1">
+            API Match ID override{match.cricketdata_match_id ? <span className="text-gray-600 ml-2">current: {match.cricketdata_match_id}</span> : null}
+          </label>
+          <div className="flex gap-2">
+            <input
+              value={newMatchId}
+              onChange={e => setNewMatchId(e.target.value)}
+              placeholder="Paste correct ID from cricapi if scores not loading"
+              className="flex-1 bg-gray-800 text-white rounded-xl px-3 py-2 text-sm border border-gray-700 focus:outline-none focus:border-yellow-400 font-mono"
+            />
+            <button
+              onClick={fixMatchId}
+              disabled={!!loading || !newMatchId.trim()}
+              className="bg-orange-600 text-white px-3 py-2 rounded-xl text-sm hover:bg-orange-500 transition disabled:opacity-50 whitespace-nowrap"
+            >
+              {loading === "fixid" ? "Saving…" : "Fix ID"}
+            </button>
+          </div>
+        </div>
+      )}
 
       {/* Result announcement */}
       {match.status === "live" && (

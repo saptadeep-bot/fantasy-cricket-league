@@ -104,69 +104,87 @@ async function computeAndSave(matchId: string, scorecard: unknown[]) {
   return { updated: updated + remapped, total: pointsMap.size, remapped, missed: nameMissed }
 }
 
-async function fetchAndSaveScores(matchId: string, cricketdataMatchId: string) {
-  let resolvedId = cricketdataMatchId
-
+/** Try to fetch scorecard for a given ID, returns scorecard array or null */
+async function tryScorecard(id: string): Promise<unknown[] | null> {
   const res = await fetch(
-    `https://api.cricapi.com/v1/match_scorecard?apikey=${CRICKETDATA_API_KEY}&id=${resolvedId}`,
+    `https://api.cricapi.com/v1/match_scorecard?apikey=${CRICKETDATA_API_KEY}&id=${id}`,
     { cache: "no-store" }
   )
   const data = await res.json()
+  if (data.status === "success") {
+    const sc = data.data?.scorecard || []
+    return sc.length > 0 ? sc : null
+  }
+  return null
+}
 
-  if (data.status !== "success") {
-    const reason = (data.reason || data.message || "").toLowerCase()
+/** Search currentMatches for our match by team names, trying multiple word strategies */
+async function findLiveMatchId(team1: string, team2: string, excludeId: string): Promise<string | null> {
+  // Fetch up to two pages of current matches
+  const pages = await Promise.all([
+    fetch(`https://api.cricapi.com/v1/currentMatches?apikey=${CRICKETDATA_API_KEY}&offset=0`, { cache: "no-store" }).then(r => r.json()),
+    fetch(`https://api.cricapi.com/v1/currentMatches?apikey=${CRICKETDATA_API_KEY}&offset=25`, { cache: "no-store" }).then(r => r.json()),
+  ])
 
-    if (reason.includes("not found") || reason.includes("invalid")) {
-      // Match ID may differ between scheduled and live — auto-correct
-      const { data: matchRow } = await supabaseAdmin
-        .from("matches")
-        .select("team1, team2")
-        .eq("id", matchId)
-        .single()
+  const liveMatches: { id: string; name: string; teams?: string[] }[] = [
+    ...(pages[0].data || []),
+    ...(pages[1].data || []),
+  ]
 
-      if (matchRow) {
-        const liveRes = await fetch(
-          `https://api.cricapi.com/v1/currentMatches?apikey=${CRICKETDATA_API_KEY}&offset=0`,
-          { cache: "no-store" }
-        )
-        const liveData = await liveRes.json()
-        const liveMatches: { id: string; teams: string[] }[] = liveData.data || []
+  // Build word lists for each team — last word, first word, and full name
+  const words1 = [
+    team1.split(" ").pop()!,
+    team1.split(" ")[0],
+    team1,
+  ].map(w => w.toLowerCase())
 
-        const t1 = matchRow.team1.split(" ").pop()!.toLowerCase()
-        const t2 = matchRow.team2.split(" ").pop()!.toLowerCase()
-        const found = liveMatches.find(m =>
-          m.teams?.some((t: string) => t.toLowerCase().includes(t1)) &&
-          m.teams?.some((t: string) => t.toLowerCase().includes(t2))
-        )
+  const words2 = [
+    team2.split(" ").pop()!,
+    team2.split(" ")[0],
+    team2,
+  ].map(w => w.toLowerCase())
 
-        if (found && found.id !== cricketdataMatchId) {
-          await supabaseAdmin
-            .from("matches")
-            .update({ cricketdata_match_id: found.id })
-            .eq("id", matchId)
-          resolvedId = found.id
+  const matchesTeam = (haystack: string, words: string[]) =>
+    words.some(w => haystack.toLowerCase().includes(w))
 
-          const retryRes = await fetch(
-            `https://api.cricapi.com/v1/match_scorecard?apikey=${CRICKETDATA_API_KEY}&id=${resolvedId}`,
-            { cache: "no-store" }
-          )
-          const retryData = await retryRes.json()
-          if (retryData.status === "success") {
-            const scorecard = retryData.data?.scorecard || []
-            if (scorecard.length === 0) throw new Error("Scorecard is empty — match may just be starting.")
-            return await computeAndSave(matchId, scorecard)
-          }
-          throw new Error("Scorecard unavailable even after ID correction.")
-        }
+  const found = liveMatches.find(m => {
+    if (m.id === excludeId) return false
+    const teamStr = (m.teams || []).join(" ") + " " + (m.name || "")
+    return matchesTeam(teamStr, words1) && matchesTeam(teamStr, words2)
+  })
+
+  return found?.id ?? null
+}
+
+async function fetchAndSaveScores(matchId: string, cricketdataMatchId: string) {
+  // Step 1: try the stored ID
+  let scorecard = await tryScorecard(cricketdataMatchId)
+
+  // Step 2: if that failed (error or empty), search currentMatches for the real live ID
+  if (!scorecard) {
+    const { data: matchRow } = await supabaseAdmin
+      .from("matches")
+      .select("team1, team2")
+      .eq("id", matchId)
+      .single()
+
+    if (matchRow) {
+      const newId = await findLiveMatchId(matchRow.team1, matchRow.team2, cricketdataMatchId)
+
+      if (newId) {
+        // Persist the corrected ID so future calls work immediately
+        await supabaseAdmin
+          .from("matches")
+          .update({ cricketdata_match_id: newId })
+          .eq("id", matchId)
+
+        scorecard = await tryScorecard(newId)
       }
-      throw new Error("Scorecard not available yet. Match may still be starting.")
     }
-    throw new Error(`Cricket API error: ${data.reason || data.message || "Unknown"}`)
   }
 
-  const scorecard = data.data?.scorecard || []
-  if (scorecard.length === 0) {
-    throw new Error("Scorecard empty — match may not have started yet.")
+  if (!scorecard) {
+    throw new Error("Scorecard not available yet — match may still be starting or API ID mismatch. Try again in a minute.")
   }
 
   return await computeAndSave(matchId, scorecard)
