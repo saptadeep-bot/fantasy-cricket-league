@@ -144,7 +144,24 @@ interface ScorecardResult {
   detail: string  // always populated — tells us exactly what came back
 }
 
+/** Extract scorecard array from any cricapi response shape */
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+function extractScorecard(data: any): unknown[] | null {
+  if (!data) return null
+  // Shape 1: data.data.scorecard  (match_scorecard standard)
+  if (Array.isArray(data.data?.scorecard) && data.data.scorecard.length > 0) return data.data.scorecard
+  // Shape 2: data.data is the scorecard array directly
+  if (Array.isArray(data.data) && data.data.length > 0 && data.data[0]?.batting) return data.data
+  // Shape 3: single innings flat in data.data
+  if (data.data?.batting || data.data?.bowling) return [data.data]
+  // Shape 4: match_info style — scorecard nested under data.cards or data.innings
+  if (Array.isArray(data.data?.cards) && data.data.cards.length > 0) return data.data.cards
+  if (Array.isArray(data.data?.innings) && data.data.innings.length > 0) return data.data.innings
+  return null
+}
+
 async function tryScorecard(id: string): Promise<ScorecardResult> {
+  // ── Attempt 1: match_scorecard endpoint ──────────────────────────────────
   try {
     const res = await fetch(
       `https://api.cricapi.com/v1/match_scorecard?apikey=${CRICKETDATA_API_KEY}&id=${id}`,
@@ -152,31 +169,36 @@ async function tryScorecard(id: string): Promise<ScorecardResult> {
     )
     const data = await res.json()
 
-    if (data.status !== "success") {
-      return { scorecard: null, detail: `API error: status=${data.status} reason=${data.reason || data.message || "none"}` }
+    if (data.status === "success") {
+      const sc = extractScorecard(data)
+      if (sc) return { scorecard: sc, detail: "match_scorecard ok" }
+      const dataKeys = data.data ? Object.keys(data.data).join(",") : "null"
+      // Don't give up yet — fall through to match_info
+      // (scorecard endpoint returned success but no innings data yet)
+      return { scorecard: null, detail: `match_scorecard empty (keys: ${dataKeys})` }
     }
+    // "not found" from scorecard endpoint — fall through to match_info
+  } catch {
+    // fall through
+  }
 
-    // The cricapi response can have the scorecard in several places depending on version
-    let sc: unknown[] = []
+  // ── Attempt 2: match_info endpoint (works for live matches) ──────────────
+  try {
+    const res = await fetch(
+      `https://api.cricapi.com/v1/match_info?apikey=${CRICKETDATA_API_KEY}&id=${id}`,
+      { cache: "no-store" }
+    )
+    const data = await res.json()
 
-    if (Array.isArray(data.data?.scorecard) && data.data.scorecard.length > 0) {
-      sc = data.data.scorecard                      // standard: data.data.scorecard
-    } else if (Array.isArray(data.data) && data.data.length > 0) {
-      sc = data.data                                // alternative: data.data is the array
-    } else if (data.data?.batting || data.data?.bowling) {
-      sc = [data.data]                              // single innings directly in data.data
+    if (data.status === "success") {
+      const sc = extractScorecard(data)
+      if (sc) return { scorecard: sc, detail: "match_info ok" }
+      const dataKeys = data.data ? Object.keys(data.data).join(",") : "null"
+      return { scorecard: null, detail: `match_info empty (keys: ${dataKeys})` }
     }
-
-    if (sc.length > 0) {
-      return { scorecard: sc, detail: "ok" }
-    }
-
-    // Success but empty — include what data.data actually looks like for debugging
-    const dataKeys = data.data ? Object.keys(data.data).join(",") : "null"
-    return { scorecard: null, detail: `empty scorecard — data keys: ${dataKeys}` }
-
+    return { scorecard: null, detail: `match_info failed: ${data.reason || data.message || data.status}` }
   } catch (e) {
-    return { scorecard: null, detail: `network/parse error: ${String(e)}` }
+    return { scorecard: null, detail: `network error: ${String(e)}` }
   }
 }
 
