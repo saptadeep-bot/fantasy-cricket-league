@@ -1,160 +1,28 @@
 import { auth } from "@/auth"
 import { supabaseAdmin } from "@/lib/supabase"
-import { calculateFantasyPoints } from "@/lib/fantasy-points"
+import { computeAndSave } from "@/lib/match-scoring"
 import { NextRequest, NextResponse } from "next/server"
 
 export const maxDuration = 60
 
 const CRICKETDATA_API_KEY = process.env.CRICKETDATA_API_KEY!
 
-// ─── Name matching ────────────────────────────────────────────────────────────
-// Cricapi can return names in many formats: "V Kohli", "RG Sharma", "MS Dhoni",
-// "Virat Kohli", "Rohit Sharma". We need to match all these to DB names.
-function norm(s: string) {
-  return s.toLowerCase().replace(/\./g, "").replace(/\s+/g, " ").trim()
-}
-
-function namesMatch(a: string, b: string): boolean {
-  const na = norm(a)
-  const nb = norm(b)
-  if (na === nb) return true
-
-  const pa = na.split(" ")
-  const pb = nb.split(" ")
-
-  // Surname (last word) must match
-  if (pa[pa.length - 1] !== pb[pb.length - 1]) return false
-
-  const fa = pa[0]  // first part of name A
-  const fb = pb[0]  // first part of name B
-
-  if (fa === fb) return true
-
-  // Single initial: "v" matches "virat"
-  if (fa.length === 1 && fb.startsWith(fa)) return true
-  if (fb.length === 1 && fa.startsWith(fb)) return true
-
-  // Double/triple initials: "rg" or "ms" — just check first letter matches
-  // e.g. "ms" (MS Dhoni) matches "mahendra" — same first letter
-  if (fa.length <= 3 && fb.length > 3 && fa[0] === fb[0]) return true
-  if (fb.length <= 3 && fa.length > 3 && fb[0] === fa[0]) return true
-
-  return false
-}
-
-// ─── computeAndSave ───────────────────────────────────────────────────────────
-async function computeAndSave(matchId: string, scorecard: unknown[]) {
-  const pointsMap = calculateFantasyPoints(scorecard)
-  if (pointsMap.size === 0) return { updated: 0, total: 0, remapped: 0, missed: [] as string[] }
-
-  const { data: dbPlayers } = await supabaseAdmin
-    .from("match_players")
-    .select("cricketdata_player_id, name")
-    .eq("match_id", matchId)
-
-  const dbList = (dbPlayers || []).map(p => ({
-    id: p.cricketdata_player_id,
-    name: p.name,
-  }))
-  const dbIds = new Set(dbList.map(p => p.id))
-
-  const now = new Date().toISOString()
-  const directUpdates: Array<{ id: string; points: number }> = []
-  const idRemaps: Array<{ oldId: string; newId: string; fantasyPoints: number }> = []
-  const nameMissed: string[] = []
-
-  for (const [playerId, pts] of pointsMap.entries()) {
-    const fantasyPoints = Math.round(pts.total * 10) / 10
-
-    if (dbIds.has(playerId)) {
-      // Perfect ID match — direct update
-      directUpdates.push({ id: playerId, points: fantasyPoints })
-    } else {
-      // Try fuzzy name match (handles "V Kohli" ↔ "Virat Kohli" etc.)
-      const match = dbList.find(p => namesMatch(pts.name, p.name))
-      if (match) {
-        idRemaps.push({ oldId: match.id, newId: playerId, fantasyPoints })
-      } else {
-        nameMissed.push(pts.name)
-      }
-    }
-  }
-
-  // Parallel direct updates
-  const directResults = await Promise.all(
-    directUpdates.map(({ id, points }) =>
-      supabaseAdmin
-        .from("match_players")
-        .update({ fantasy_points: points, last_updated: now })
-        .eq("match_id", matchId)
-        .eq("cricketdata_player_id", id)
-    )
-  )
-  const updated = directResults.filter(r => !r.error).length
-
-  // Name-based remaps: correct stored ID and save points
-  let remapped = 0
-  for (const { oldId, newId, fantasyPoints } of idRemaps) {
-    const { error } = await supabaseAdmin
-      .from("match_players")
-      .update({ cricketdata_player_id: newId, fantasy_points: fantasyPoints, last_updated: now })
-      .eq("match_id", matchId)
-      .eq("cricketdata_player_id", oldId)
-    if (!error) remapped++
-  }
-
-  // Repair team player_ids / captain / vc that used old IDs
-  if (idRemaps.length > 0) {
-    const { data: teamsData } = await supabaseAdmin
-      .from("teams")
-      .select("id, player_ids, captain_id, vice_captain_id")
-      .eq("match_id", matchId)
-
-    for (const team of (teamsData || [])) {
-      let changed = false
-      let playerIds: string[] = team.player_ids || []
-      let captainId: string = team.captain_id
-      let vcId: string = team.vice_captain_id
-
-      for (const { oldId, newId } of idRemaps) {
-        if (playerIds.includes(oldId)) {
-          playerIds = playerIds.map(pid => (pid === oldId ? newId : pid))
-          changed = true
-        }
-        if (captainId === oldId) { captainId = newId; changed = true }
-        if (vcId === oldId) { vcId = newId; changed = true }
-      }
-
-      if (changed) {
-        await supabaseAdmin
-          .from("teams")
-          .update({ player_ids: playerIds, captain_id: captainId, vice_captain_id: vcId })
-          .eq("id", team.id)
-      }
-    }
-  }
-
-  return { updated: updated + remapped, total: pointsMap.size, remapped, missed: nameMissed }
-}
-
 // ─── Scorecard fetch helpers ──────────────────────────────────────────────────
 
 interface ScorecardResult {
   scorecard: unknown[] | null
-  detail: string  // always populated — tells us exactly what came back
+  detail: string
+  liveInProgress?: boolean
+  notStarted?: boolean
 }
 
 /** Extract scorecard array from any cricapi response shape */
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 function extractScorecard(data: any): unknown[] | null {
   if (!data) return null
-  // Shape 1: data.data.scorecard  (match_scorecard standard)
   if (Array.isArray(data.data?.scorecard) && data.data.scorecard.length > 0) return data.data.scorecard
-  // Shape 2: data.data is the scorecard array directly
   if (Array.isArray(data.data) && data.data.length > 0 && data.data[0]?.batting) return data.data
-  // Shape 3: single innings flat in data.data
   if (data.data?.batting || data.data?.bowling) return [data.data]
-  // Shape 4: match_info style — scorecard nested under data.cards or data.innings
   if (Array.isArray(data.data?.cards) && data.data.cards.length > 0) return data.data.cards
   if (Array.isArray(data.data?.innings) && data.data.innings.length > 0) return data.data.innings
   return null
@@ -173,16 +41,13 @@ async function tryScorecard(id: string): Promise<ScorecardResult> {
       const sc = extractScorecard(data)
       if (sc) return { scorecard: sc, detail: "match_scorecard ok" }
       const dataKeys = data.data ? Object.keys(data.data).join(",") : "null"
-      // Don't give up yet — fall through to match_info
-      // (scorecard endpoint returned success but no innings data yet)
       return { scorecard: null, detail: `match_scorecard empty (keys: ${dataKeys})` }
     }
-    // "not found" from scorecard endpoint — fall through to match_info
   } catch {
     // fall through
   }
 
-  // ── Attempt 2: match_info endpoint (works for live matches) ──────────────
+  // ── Attempt 2: match_info (check match state, sometimes has data) ─────────
   try {
     const res = await fetch(
       `https://api.cricapi.com/v1/match_info?apikey=${CRICKETDATA_API_KEY}&id=${id}`,
@@ -191,15 +56,50 @@ async function tryScorecard(id: string): Promise<ScorecardResult> {
     const data = await res.json()
 
     if (data.status === "success") {
+      const matchData = data.data
+
+      // Use truthy/falsy — cricapi returns these as booleans, strings, or numbers
+      const started = matchData?.matchStarted
+      const ended = matchData?.matchEnded
+
+      if (started && !ended) {
+        // Match is live — scorecard not yet available mid-innings via this API
+        return {
+          scorecard: null,
+          detail: `live_in_progress (fantasyEnabled:${matchData.fantasyEnabled}, bbbEnabled:${matchData.bbbEnabled}, matchStarted:${started}, matchEnded:${ended})`,
+          liveInProgress: true,
+        }
+      }
+
+      if (!started) {
+        return {
+          scorecard: null,
+          detail: `match_not_started (matchStarted:${started})`,
+          notStarted: true,
+        }
+      }
+
+      // started && ended — match complete but scorecard unavailable
       const sc = extractScorecard(data)
       if (sc) return { scorecard: sc, detail: "match_info ok" }
-      const dataKeys = data.data ? Object.keys(data.data).join(",") : "null"
-      return { scorecard: null, detail: `match_info empty (keys: ${dataKeys})` }
+
+      const dataKeys = matchData ? Object.keys(matchData).join(",") : "null"
+      return { scorecard: null, detail: `match_info empty (matchStarted:${started}, matchEnded:${ended}, keys: ${dataKeys})` }
     }
     return { scorecard: null, detail: `match_info failed: ${data.reason || data.message || data.status}` }
   } catch (e) {
     return { scorecard: null, detail: `network error: ${String(e)}` }
   }
+}
+
+interface FetchResult {
+  updated: number
+  total: number
+  remapped: number
+  autoAdded: number
+  missed: string[]
+  liveInProgress?: boolean
+  notStarted?: boolean
 }
 
 async function findLiveMatchId(team1: string, team2: string): Promise<string | null> {
@@ -232,14 +132,16 @@ async function findLiveMatchId(team1: string, team2: string): Promise<string | n
   return found?.id ?? null
 }
 
-async function fetchAndSaveScores(matchId: string, cricketdataMatchId: string) {
+async function fetchAndSaveScores(matchId: string, cricketdataMatchId: string): Promise<FetchResult> {
   // Step 1: try the stored ID
   const r1 = await tryScorecard(cricketdataMatchId)
   let scorecard = r1.scorecard
   let lastDetail = `stored ID (${cricketdataMatchId}): ${r1.detail}`
+  let liveInProgress = r1.liveInProgress ?? false
+  let notStarted = r1.notStarted ?? false
 
-  // Step 2: if no scorecard, search currentMatches for the correct live ID
-  if (!scorecard) {
+  // Step 2: if no scorecard and not definitively live/unstarted, search currentMatches
+  if (!scorecard && !liveInProgress && !notStarted) {
     const { data: matchRow } = await supabaseAdmin
       .from("matches")
       .select("team1, team2")
@@ -259,16 +161,21 @@ async function fetchAndSaveScores(matchId: string, cricketdataMatchId: string) {
         }
         const r2 = await tryScorecard(foundId)
         scorecard = r2.scorecard
+        liveInProgress = r2.liveInProgress ?? false
+        notStarted = r2.notStarted ?? false
         lastDetail += ` | retry (${foundId}): ${r2.detail}`
       }
     }
   }
 
   if (!scorecard) {
+    if (liveInProgress) return { updated: 0, total: 0, remapped: 0, autoAdded: 0, missed: [], liveInProgress: true }
+    if (notStarted) return { updated: 0, total: 0, remapped: 0, autoAdded: 0, missed: [], notStarted: true }
     throw new Error(`Scorecard unavailable. Debug: ${lastDetail}`)
   }
 
-  return await computeAndSave(matchId, scorecard)
+  const result = await computeAndSave(matchId, scorecard)
+  return result
 }
 
 // ─── DB read helpers ──────────────────────────────────────────────────────────
@@ -307,8 +214,34 @@ export async function POST(req: NextRequest, { params }: { params: Promise<{ id:
 
   try {
     const result = await fetchAndSaveScores(id, match.cricketdata_match_id)
+
+    if (result.liveInProgress) {
+      const players = await readPlayersFromDb(id)
+      return NextResponse.json({
+        success: false,
+        liveInProgress: true,
+        error: "Match is currently live — player scores are updated by cricapi after each innings completes. Points will appear automatically once an innings ends.",
+        players,
+      })
+    }
+
+    if (result.notStarted) {
+      const players = await readPlayersFromDb(id)
+      return NextResponse.json({
+        success: false,
+        notStarted: true,
+        error: "Match hasn't started yet. Scores will be available once the match begins.",
+        players,
+      })
+    }
+
     const players = await readPlayersFromDb(id)
-    return NextResponse.json({ success: true, players, ...result })
+    const msg = [
+      `Updated ${result.updated}/${result.total} player scores`,
+      result.remapped > 0 ? `${result.remapped} ID remapped` : "",
+      result.autoAdded > 0 ? `${result.autoAdded} new player(s) added (${result.missed.length === 0 ? "OK" : result.missed.join(", ")})` : "",
+    ].filter(Boolean).join(". ")
+    return NextResponse.json({ success: true, players, ...result, message: msg })
   } catch (err) {
     return NextResponse.json({ error: String(err).replace(/^Error:\s*/, "") }, { status: 400 })
   }
@@ -331,7 +264,7 @@ export async function GET(req: NextRequest, { params }: { params: Promise<{ id: 
     return NextResponse.json({ players, teams })
   }
 
-  // Auto-poll: fetch from API if data is >90 seconds stale
+  // Auto-poll: fetch from API if data is stale (>45 seconds)
   const { data: match } = await supabaseAdmin
     .from("matches")
     .select("status, cricketdata_match_id")
@@ -351,21 +284,23 @@ export async function GET(req: NextRequest, { params }: { params: Promise<{ id: 
       .single()
 
     const lastUpdated = lastPlayer?.last_updated ? new Date(lastPlayer.last_updated) : null
-    const isStale = !lastUpdated || lastUpdated < new Date(Date.now() - 90_000)
+    const isStale = !lastUpdated || lastUpdated < new Date(Date.now() - 45_000)
 
     if (isStale) {
       try {
         await fetchAndSaveScores(id, match.cricketdata_match_id)
-      } catch (err) {
-        fetchError = String(err).replace(/^Error:\s*/, "")
+        // Any result (including liveInProgress/notStarted) is fine — never set fetchError during live
+      } catch {
+        // Match is live per our DB — API failures mid-innings are expected.
+        // Silently swallow the error and keep polling every 60s.
+        // Scores will appear automatically once cricapi has the scorecard ready.
       }
     }
   }
 
   const [players, teams] = await Promise.all([readPlayersFromDb(id), readTeamsFromDb(id)])
 
-  // Only surface API errors when there are no scores yet
-  const hasScores = players.some(p => (p.fantasy_points || 0) > 0)
+  const hasScores = players.some((p: { fantasy_points?: number }) => (p.fantasy_points || 0) > 0)
   return NextResponse.json({
     players,
     teams,

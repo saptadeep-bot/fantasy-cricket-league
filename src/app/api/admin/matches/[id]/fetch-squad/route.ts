@@ -1,4 +1,5 @@
 import { auth } from "@/auth"
+import { supabaseAdmin } from "@/lib/supabase"
 import { NextRequest, NextResponse } from "next/server"
 
 const CRICKETDATA_API_KEY = process.env.CRICKETDATA_API_KEY!
@@ -20,8 +21,6 @@ export async function POST(req: NextRequest, { params }: { params: Promise<{ id:
     return NextResponse.json({ error: "Unauthorized" }, { status: 401 })
   }
 
-  const { supabaseAdmin } = await import("@/lib/supabase")
-
   const { data: match } = await supabaseAdmin
     .from("matches")
     .select("cricketdata_match_id, team1, team2")
@@ -41,11 +40,14 @@ export async function POST(req: NextRequest, { params }: { params: Promise<{ id:
       return NextResponse.json({ error: "API error: " + JSON.stringify(data) }, { status: 500 })
     }
 
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
     const teams: any[] = data.data || []
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
     const players: any[] = []
 
     for (const team of teams) {
       const teamName = team.teamName || team.teamInfo?.name || team.team || "Unknown"
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
       const squad: any[] = team.players || team.squad || []
 
       for (const player of squad) {
@@ -58,8 +60,7 @@ export async function POST(req: NextRequest, { params }: { params: Promise<{ id:
       }
     }
 
-    // Save full squad to DB so users can start picking teams immediately
-    const { supabaseAdmin } = await import("@/lib/supabase")
+    // Delete existing players and re-insert fresh squad
     await supabaseAdmin.from("match_players").delete().eq("match_id", id)
     const { error: insertError } = await supabaseAdmin.from("match_players").insert(
       players.map(p => ({

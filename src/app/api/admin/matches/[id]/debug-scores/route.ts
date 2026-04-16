@@ -57,6 +57,8 @@ export async function GET(req: NextRequest, { params }: { params: Promise<{ id: 
         hasScorecard: Array.isArray(scorecard?.data?.scorecard),
         scorecardLength: scorecard?.data?.scorecard?.length ?? 0,
         dataKeys: scorecard?.data ? Object.keys(scorecard.data) : null,
+        // Full raw response for diagnosis (first 2 innings if present)
+        rawScorecard: scorecard?.data?.scorecard?.slice(0, 2) ?? null,
       },
       match_info: {
         status: matchInfo?.status,
@@ -86,6 +88,28 @@ export async function GET(req: NextRequest, { params }: { params: Promise<{ id: 
             matchCount: seriesInfo?.data?.matchList?.length ?? seriesInfo?.data?.matches?.length ?? "unknown",
           }
         : "skipped (no series_id)",
+    },
+
+    // Diagnosis summary
+    diagnosis: {
+      fantasyEnabled: matchInfo?.data?.fantasyEnabled ?? liveMatch?.fantasyEnabled ?? "unknown",
+      bbbEnabled: matchInfo?.data?.bbbEnabled ?? liveMatch?.bbbEnabled ?? "unknown",
+      matchStarted: matchInfo?.data?.matchStarted ?? "unknown",
+      matchEnded: matchInfo?.data?.matchEnded ?? "unknown",
+      scorecardAvailable: Array.isArray(scorecard?.data?.scorecard) && scorecard.data.scorecard.length > 0,
+      likelyCause: (() => {
+        if (scorecard?.status === "success" && Array.isArray(scorecard?.data?.scorecard) && scorecard.data.scorecard.length > 0)
+          return "Scorecard OK — use POST /scores to save"
+        if (matchInfo?.data?.fantasyEnabled === false)
+          return "fantasyEnabled=false — cricapi will not serve player stats for this match"
+        if (matchInfo?.data?.matchStarted === false)
+          return "Match has not started yet"
+        if (matchInfo?.data?.matchStarted === true && matchInfo?.data?.matchEnded === false)
+          return "Match in progress — scorecard may not be available mid-innings on this API tier"
+        if (scorecard?.status !== "success")
+          return `match_scorecard failed: ${scorecard?.reason || scorecard?.message || scorecard?.status}`
+        return "Unknown — check rawScorecard and dataKeys above"
+      })(),
     },
   })
 }

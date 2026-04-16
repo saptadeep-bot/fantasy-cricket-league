@@ -167,8 +167,8 @@ export default function LiveMatchView({
   useEffect(() => {
     if (match.status === "live") {
       fetchLiveScores()
-      // Poll every 90 seconds — server only calls API if data is stale
-      const interval = setInterval(fetchLiveScores, 90 * 1000)
+      // Poll every 60 seconds — server only calls API if data is stale
+      const interval = setInterval(fetchLiveScores, 60 * 1000)
       return () => clearInterval(interval)
     }
   }, [match.status, fetchLiveScores])
@@ -265,22 +265,30 @@ export default function LiveMatchView({
               {rankedTeams.length === 0 ? (
                 <p className="text-gray-500 text-sm">No teams submitted yet.</p>
               ) : (
-                rankedTeams.map((team, idx) => (
-                  <div key={team.id} className={`bg-gray-900 border rounded-2xl p-4 flex items-center justify-between ${
-                    team.user_id === currentUserId ? "border-yellow-400/50" : "border-gray-800"
-                  }`}>
-                    <div className="flex items-center gap-3">
-                      <span className="text-xl font-bold text-gray-600">#{idx + 1}</span>
-                      <div>
-                        <p className="text-white font-medium">{team.users?.name}</p>
-                        {team.user_id === currentUserId && (
-                          <span className="text-xs text-yellow-400">You</span>
-                        )}
-                      </div>
+                <>
+                  {/* Show info banner when match is live but no scores yet */}
+                  {match.status === "live" && rankedTeams.every(t => t.liveScore === 0) && !pollError && (
+                    <div className="bg-blue-950 border border-blue-800 rounded-xl px-4 py-2.5 text-blue-300 text-xs">
+                      🏏 Match in progress — fantasy points will appear once the first innings gets underway. This page refreshes automatically.
                     </div>
-                    <p className="text-white font-bold text-lg">{team.liveScore} pts</p>
-                  </div>
-                ))
+                  )}
+                  {rankedTeams.map((team, idx) => (
+                    <div key={team.id} className={`bg-gray-900 border rounded-2xl p-4 flex items-center justify-between ${
+                      team.user_id === currentUserId ? "border-yellow-400/50" : "border-gray-800"
+                    }`}>
+                      <div className="flex items-center gap-3">
+                        <span className="text-xl font-bold text-gray-600">#{idx + 1}</span>
+                        <div>
+                          <p className="text-white font-medium">{team.users?.name}</p>
+                          {team.user_id === currentUserId && (
+                            <span className="text-xs text-yellow-400">You</span>
+                          )}
+                        </div>
+                      </div>
+                      <p className="text-white font-bold text-lg">{team.liveScore} pts</p>
+                    </div>
+                  ))}
+                </>
               )}
             </>
           )}

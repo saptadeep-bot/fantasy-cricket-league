@@ -1,6 +1,6 @@
 import { auth } from "@/auth"
 import { supabaseAdmin } from "@/lib/supabase"
-import { calculateFantasyPoints } from "@/lib/fantasy-points"
+import { computeAndSave } from "@/lib/match-scoring"
 import { getEntryFee, calcPrizes } from "@/lib/prizes"
 import { NextRequest, NextResponse } from "next/server"
 
@@ -23,7 +23,7 @@ export async function POST(req: NextRequest, { params }: { params: Promise<{ id:
   if (match.status === "completed") return NextResponse.json({ error: "Match already finalized" }, { status: 400 })
 
   try {
-    // Step 1: Fetch final scorecard and calculate points using custom IPL ruleset
+    // Step 1: Fetch final scorecard
     const res = await fetch(
       `https://api.cricapi.com/v1/match_scorecard?apikey=${CRICKETDATA_API_KEY}&id=${match.cricketdata_match_id}`,
       { cache: "no-store" }
@@ -31,49 +31,39 @@ export async function POST(req: NextRequest, { params }: { params: Promise<{ id:
     const data = await res.json()
 
     if (data.status !== "success") {
-      return NextResponse.json({ error: `Scorecard API error: ${data.message || JSON.stringify(data)}` }, { status: 500 })
+      return NextResponse.json({
+        error: `Scorecard API error: ${data.message || data.reason || JSON.stringify(data)}`
+      }, { status: 500 })
     }
 
     const scorecard = data.data?.scorecard || []
 
-    // Hard stop — must have both innings before finalizing
     if (scorecard.length === 0) {
-      return NextResponse.json({ error: "No scorecard data returned from API. Match may not have ended yet. Try again in a minute." }, { status: 400 })
+      return NextResponse.json({
+        error: "No scorecard data returned from API. Match may not have ended yet. Try again in a minute."
+      }, { status: 400 })
     }
     if (scorecard.length < 2) {
-      return NextResponse.json({ error: `Only ${scorecard.length} innings found in scorecard. Both innings must be complete before finalizing.` }, { status: 400 })
+      return NextResponse.json({
+        error: `Only ${scorecard.length} innings in scorecard. Both innings must be complete before finalizing.`
+      }, { status: 400 })
     }
 
-    const fantasyPointsMap = calculateFantasyPoints(scorecard)
+    // Step 2: Compute and save all player fantasy points (uses name-matching + auto-insert for impact subs)
+    await computeAndSave(id, scorecard)
 
-    // Build points lookup map and update match_players
-    const pointsMap: Record<string, number> = {}
-    for (const [playerId, pts] of fantasyPointsMap.entries()) {
-      pointsMap[playerId] = Math.round(pts.total * 10) / 10
-    }
-
-    // Update all match_players with final points
-    for (const [playerId, points] of Object.entries(pointsMap)) {
-      await supabaseAdmin
-        .from("match_players")
-        .update({ fantasy_points: points, last_updated: new Date().toISOString() })
-        .eq("match_id", id)
-        .eq("cricketdata_player_id", playerId)
-    }
-
-    // Step 2: Fetch all submitted teams for this match
+    // Step 3: Fetch all submitted teams
     const { data: teams } = await supabaseAdmin
       .from("teams")
       .select("*, users(id, name, email)")
       .eq("match_id", id)
 
     if (!teams || teams.length === 0) {
-      // No teams submitted — mark abandoned
       await supabaseAdmin.from("matches").update({ status: "completed" }).eq("id", id)
       return NextResponse.json({ success: true, message: "No teams submitted. Match marked complete with no payout." })
     }
 
-    // Step 3: Fetch match players for point lookup
+    // Step 4: Fetch updated match players for point lookup
     const { data: matchPlayers } = await supabaseAdmin
       .from("match_players")
       .select("cricketdata_player_id, fantasy_points")
@@ -84,27 +74,22 @@ export async function POST(req: NextRequest, { params }: { params: Promise<{ id:
       playerPointsMap[mp.cricketdata_player_id] = mp.fantasy_points || 0
     }
 
-    // Step 4: Compute each user's total points
-    const userScores: Array<{
-      user_id: string
-      raw_points: number
-      final_points: number
-    }> = []
+    // Step 5: Compute each user's total points
+    const userScores: Array<{ user_id: string; raw_points: number; final_points: number }> = []
 
     for (const team of teams) {
       const playerIds: string[] = team.player_ids || []
       let finalPoints = 0
+      let rawPoints = 0
 
       for (const pid of playerIds) {
         const rawPts = playerPointsMap[pid] || 0
+        rawPoints += rawPts
         let multiplier = 1.0
         if (pid === team.captain_id) multiplier = 2.0
         else if (pid === team.vice_captain_id) multiplier = 1.5
         finalPoints += rawPts * multiplier
       }
-
-      // raw_points = sum without multiplier
-      const rawPoints = playerIds.reduce((sum, pid) => sum + (playerPointsMap[pid] || 0), 0)
 
       userScores.push({
         user_id: team.user_id,
@@ -113,7 +98,7 @@ export async function POST(req: NextRequest, { params }: { params: Promise<{ id:
       })
     }
 
-    // Step 5: Rank users (handle ties)
+    // Step 6: Rank users (handle ties)
     userScores.sort((a, b) => b.final_points - a.final_points)
 
     const ranked: Array<(typeof userScores)[0] & { rank: number }> = []
@@ -127,7 +112,7 @@ export async function POST(req: NextRequest, { params }: { params: Promise<{ id:
       currentRank++
     }
 
-    // Step 6: Calculate prizes
+    // Step 7: Calculate prizes
     const ENTRY_FEE = getEntryFee(match.match_type)
     const participants = teams.length
     const totalPool = ENTRY_FEE * participants
@@ -135,19 +120,24 @@ export async function POST(req: NextRequest, { params }: { params: Promise<{ id:
     const prizeResults = calcPrizes(ranked, totalPool, ENTRY_FEE)
     const results = prizeResults.map(r => ({ ...r, match_id: id }))
 
-    // Step 7: Save results
+    // Step 8: Save results
     await supabaseAdmin.from("match_results").delete().eq("match_id", id)
     const { error: resultsError } = await supabaseAdmin.from("match_results").insert(results)
     if (resultsError) return NextResponse.json({ error: resultsError.message }, { status: 500 })
 
-    // Step 8: Mark match as completed
+    // Step 9: Mark match as completed
     await supabaseAdmin.from("matches").update({ status: "completed" }).eq("id", id)
 
     return NextResponse.json({
       success: true,
       participants,
-      totalPool: 250 * participants,
-      results: results.map(r => ({ user_id: r.user_id, rank: r.rank, final_points: r.final_points, prize_won: r.prize_won }))
+      totalPool,
+      results: results.map(r => ({
+        user_id: r.user_id,
+        rank: r.rank,
+        final_points: r.final_points,
+        prize_won: r.prize_won,
+      })),
     })
   } catch (err) {
     return NextResponse.json({ error: String(err) }, { status: 500 })

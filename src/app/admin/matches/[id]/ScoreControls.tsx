@@ -38,7 +38,15 @@ export default function ScoreControls({ match }: { match: Match }) {
     setLoading("scores")
     setMessage(null)
     const data = await callApi(`/api/admin/matches/${match.id}/scores`)
-    setMessage(data.success ? `Updated ${data.updated}/${data.total} player scores` : `Error: ${data.error}`)
+    if (data.success) {
+      setMessage(data.message || `Updated ${data.updated}/${data.total} player scores`)
+    } else if (data.liveInProgress) {
+      setMessage(`ℹ️ ${data.error}`)
+    } else if (data.notStarted) {
+      setMessage(`ℹ️ ${data.error}`)
+    } else {
+      setMessage(`Error: ${data.error}`)
+    }
     setLoading(null)
     router.refresh()
   }
@@ -167,7 +175,11 @@ export default function ScoreControls({ match }: { match: Match }) {
       )}
 
       {message && (
-        <p className={`text-sm ${message.startsWith("Error") ? "text-red-400" : "text-green-400"}`}>
+        <p className={`text-sm ${
+          message.startsWith("Error") ? "text-red-400" :
+          message.startsWith("ℹ️") ? "text-blue-400" :
+          "text-green-400"
+        }`}>
           {message}
         </p>
       )}
