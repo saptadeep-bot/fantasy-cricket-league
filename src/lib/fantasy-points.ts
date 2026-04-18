@@ -184,5 +184,32 @@ export function calculateFantasyPoints(scorecard: any[]): Map<string, PlayerFant
     }
   }
 
+  // ── Name-based deduplication ──────────────────────────────────────────────
+  // When the scorecard source (e.g. Cricbuzz) assigns different IDs to the
+  // same player in the batting table vs the bowling table, they land in
+  // playerMap as two separate entries with different IDs but the same name.
+  // If we don't merge them here, computeAndSave will try to remap both IDs to
+  // the same DB row — the second remap finds no row (first one already
+  // changed the stored ID) and the bowling / batting points are silently lost.
+  // Fix: after processing all innings, collapse entries that share the same
+  // name into a single entry by summing their points.
+  const seenNames = new Map<string, string>() // normalised name → primary ID
+  const toDelete: string[] = []
+  for (const [id, pts] of playerMap.entries()) {
+    const key = pts.name.toLowerCase().replace(/\./g, '').replace(/\s+/g, ' ').trim()
+    if (seenNames.has(key)) {
+      const primaryId = seenNames.get(key)!
+      const primary = playerMap.get(primaryId)!
+      primary.batting  += pts.batting
+      primary.bowling  += pts.bowling
+      primary.fielding += pts.fielding
+      primary.total    += pts.total
+      toDelete.push(id)
+    } else {
+      seenNames.set(key, id)
+    }
+  }
+  for (const id of toDelete) playerMap.delete(id)
+
   return playerMap
 }

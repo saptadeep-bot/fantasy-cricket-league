@@ -1,11 +1,12 @@
 import { auth } from "@/auth"
 import { supabaseAdmin } from "@/lib/supabase"
-import { computeAndSave } from "@/lib/match-scoring"
+import { computeAndSave, namesMatch } from "@/lib/match-scoring"
 import { NextRequest, NextResponse } from "next/server"
 
 export const maxDuration = 60
 
 const CRICKETDATA_API_KEY = process.env.CRICKETDATA_API_KEY!
+const CRICBUZZ_API_KEY = process.env.CRICBUZZ_API_KEY
 
 // ─── Scorecard fetch helpers ──────────────────────────────────────────────────
 
@@ -132,7 +133,475 @@ async function findLiveMatchId(team1: string, team2: string): Promise<string | n
   return found?.id ?? null
 }
 
+// ─── Cricbuzz fallback helpers ────────────────────────────────────────────────
+
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+function convertCricbuzzScorecard(scoreCard: any[]): unknown[] {
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  return scoreCard.map((innings: any) => {
+    // Handle both old (batTeamDetails) and new (batteamname) structures
+    const batTeamName: string =
+      innings.batteamname ?? innings.batTeamDetails?.batTeamName ?? "Unknown"
+    const inningsId: number = innings.inningsid ?? innings.inningsId ?? 1
+
+    // ── Batting ──────────────────────────────────────────────────────────────
+    // Batsmen: might be at innings.batsman (array/object) or innings.batTeamDetails.batsmenData (object)
+    const batsmenRaw = innings.batsman ?? innings.batTeamDetails?.batsmenData ?? {}
+    const batsmenList: unknown[] = Array.isArray(batsmenRaw)
+      ? batsmenRaw
+      : (batsmenRaw && typeof batsmenRaw === "object")
+        ? Object.values(batsmenRaw)
+        : []
+
+    const batting = batsmenList
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      .filter((bat: any) => {
+        const id = bat.batsman_id ?? bat.batId ?? bat.id ?? bat.player_id
+        const name = bat.bat_name ?? bat.batName ?? bat.name
+        return id && name
+      })
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      .map((bat: any) => ({
+        id: "cb_" + (bat.batsman_id ?? bat.batId ?? bat.id ?? bat.player_id),
+        name: bat.bat_name ?? bat.batName ?? bat.name,
+        r: Number(bat.bat_runs ?? bat.r ?? bat.runs ?? 0),
+        b: Number(bat.bat_balls ?? bat.b ?? bat.balls ?? 0),
+        "4s": Number(bat.bat_fours ?? bat["4s"] ?? bat.fours ?? 0),
+        "6s": Number(bat.bat_sixes ?? bat["6s"] ?? bat.sixes ?? 0),
+        dismissal: bat.out_desc ?? bat["dismissal-text"] ?? bat.dismissal ?? bat.outDesc ?? "",
+      }))
+
+    // ── Bowling ──────────────────────────────────────────────────────────────
+    const bowlersRaw = innings.bowler ?? innings.bowlTeamDetails?.bowlersData ?? {}
+    const bowlersList: unknown[] = Array.isArray(bowlersRaw)
+      ? bowlersRaw
+      : Object.values(bowlersRaw)
+
+    const bowling = bowlersList
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      .filter((bowl: any) => {
+        const id = bowl.bowler_id ?? bowl.bowlId ?? bowl.id ?? bowl.player_id
+        const name = bowl.bowl_name ?? bowl.bowlName ?? bowl.name
+        return id && name
+      })
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      .map((bowl: any) => ({
+        id: "cb_" + (bowl.bowler_id ?? bowl.bowlId ?? bowl.id ?? bowl.player_id),
+        name: bowl.bowl_name ?? bowl.bowlName ?? bowl.name,
+        o: bowl.bowl_overs ?? bowl.o ?? bowl.overs ?? 0,
+        m: Number(bowl.bowl_maidens ?? bowl.m ?? bowl.maidens ?? 0),
+        r: Number(bowl.bowl_runs ?? bowl.r ?? bowl.runs ?? 0),
+        w: Number(bowl.bowl_wickets ?? bowl.w ?? bowl.wickets ?? 0),
+        nb: Number(bowl.bowl_noballs ?? bowl.nb ?? bowl.noBalls ?? 0),
+        wd: Number(bowl.bowl_wides ?? bowl.wd ?? bowl.wides ?? 0),
+      }))
+
+    // ── Fielding ─────────────────────────────────────────────────────────────
+    // Try to extract fielding from fow (fall of wickets) if available
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const fowRaw = innings.fow ?? innings.wicketsData ?? {}
+    const fowList: unknown[] = Array.isArray(fowRaw) ? fowRaw : Object.values(fowRaw)
+    const fielderMap = new Map<string, { id: string; name: string; catch: number; stumped: number; runout: number; cb: number }>()
+
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    for (const wicket of fowList) {
+      const w = wicket as any
+      // Try Cricbuzz fow structure: might have fielder info
+      const fielderId = w.fielder_id ?? w.fielderId1 ?? w.fielder?.id
+      const fielderName = w.fielder_name ?? w.fielderName1 ?? w.fielder?.name
+      const wicketCode: string = (w.wicket_code ?? w.wicketCode ?? w.dismissal_type ?? "").toUpperCase()
+      if (!fielderId || !fielderName) continue
+      const fid = "cb_" + fielderId
+      if (!fielderMap.has(fid)) {
+        fielderMap.set(fid, { id: fid, name: fielderName, catch: 0, stumped: 0, runout: 0, cb: 0 })
+      }
+      const entry = fielderMap.get(fid)!
+      if (wicketCode.includes("CAUGHT AND BOWLED")) entry.cb++
+      else if (wicketCode.includes("CAUGHT")) entry.catch++
+      else if (wicketCode.includes("STUMPED")) entry.stumped++
+      else if (wicketCode.includes("RUN OUT")) entry.runout++
+    }
+    const catching = Array.from(fielderMap.values())
+
+    return {
+      inning: `${batTeamName} Inning ${inningsId}`,
+      batting,
+      bowling,
+      catching,
+    }
+  })
+}
+
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+function flattenCricbuzzMatches(data: any): any[] {
+  const allMatches: any[] = []
+  for (const typeMatch of (data.typeMatches ?? [])) {
+    for (const seriesMatch of (typeMatch.seriesMatches ?? [])) {
+      // Matches can live under seriesAdWrapper.matches (common), directly on
+      // seriesMatch.matches, or even as adWrapper fields. Collect from all.
+      const candidates = [
+        seriesMatch.seriesAdWrapper?.matches,
+        seriesMatch.matches,
+        seriesMatch.adWrapper?.matches,
+      ]
+      for (const list of candidates) {
+        if (Array.isArray(list)) allMatches.push(...list)
+      }
+    }
+  }
+  return allMatches
+}
+
+async function tryCricbuzzScorecard(team1: string, team2: string, apiKey: string): Promise<unknown[] | null> {
+  try {
+    const cbHeaders = {
+      "X-RapidAPI-Key": apiKey,
+      "X-RapidAPI-Host": "cricbuzz-cricket.p.rapidapi.com",
+    }
+
+    const tokens = (name: string): string[] => {
+      const parts = name.toLowerCase().split(/\s+/).filter(Boolean)
+      const toks = new Set<string>([name.toLowerCase(), ...parts])
+      // Acronym from initials: "Royal Challengers Bangalore" → "rcb"
+      if (parts.length >= 2) toks.add(parts.map(p => p[0]).join(""))
+      return Array.from(toks).filter(t => t.length >= 2)
+    }
+    const t1 = tokens(team1)
+    const t2 = tokens(team2)
+    const hits = (haystack: string, toks: string[]) =>
+      toks.some(t => haystack.toLowerCase().includes(t))
+
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const findInList = (allMatches: any[]) =>
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      allMatches.find((m: any) => {
+        const mi = m.matchInfo
+        if (!mi) return false
+        const haystack = [
+          mi.team1?.teamName ?? "",
+          mi.team1?.teamSName ?? "",
+          mi.team2?.teamName ?? "",
+          mi.team2?.teamSName ?? "",
+        ].join(" ")
+        return hits(haystack, t1) && hits(haystack, t2)
+      })
+
+    // Try live matches first, then recent (for completed matches)
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    let found: any = null
+    for (const endpoint of ["live", "recent"]) {
+      try {
+        const res = await fetch(`https://cricbuzz-cricket.p.rapidapi.com/matches/v1/${endpoint}`, {
+          headers: cbHeaders,
+          cache: "no-store",
+        })
+        if (!res.ok) continue
+        const data = await res.json()
+        found = findInList(flattenCricbuzzMatches(data))
+        if (found) break
+      } catch { continue }
+    }
+
+    if (!found) return null
+
+    const cbMatchId: number = found.matchInfo.matchId
+    const scRes = await fetch(`https://cricbuzz-cricket.p.rapidapi.com/mcenter/v1/${cbMatchId}/scard`, {
+      headers: cbHeaders,
+      cache: "no-store",
+    })
+    if (!scRes.ok) return null
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const scData: any = await scRes.json()
+
+    // Cricbuzz returns "scorecard" (lowercase), not "scoreCard"
+    const scArray = scData.scoreCard ?? scData.scorecard
+    if (!Array.isArray(scArray) || scArray.length === 0) return null
+
+    return convertCricbuzzScorecard(scArray)
+  } catch {
+    return null
+  }
+}
+
+// ─── EntitySport scorecard helpers ────────────────────────────────────────────
+// EntitySport's /matches/{id}/info returns a full raw scorecard with batting,
+// bowling, and fielding arrays.  This is the PRIMARY fallback when cricapi's
+// match_scorecard is empty (fantasyEnabled:false mid-innings) and Cricbuzz is
+// unavailable (quota exhausted).  Its data is Dream11-compatible because we
+// feed raw stats into our own calculateFantasyPoints — we do NOT use
+// EntitySport's pre-computed `point` field (different formula).
+
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+function convertEntitySportScorecard(innings: any[]): unknown[] {
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  return innings.map((inn: any) => {
+    const battingTeam = inn.name ?? "Unknown"
+    const inningsId = inn.number ?? 1
+
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const batting = (inn.batsmen ?? []).map((b: any) => ({
+      id: "es_" + (b.batsman_id ?? b.id ?? ""),
+      name: b.name ?? "",
+      r: Number(b.runs ?? 0),
+      b: Number(b.balls_faced ?? 0),
+      "4s": Number(b.fours ?? 0),
+      "6s": Number(b.sixes ?? 0),
+      "dismissal-text": b.how_out ?? "",
+      dismissal: b.how_out ?? "",
+    }))
+
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const bowling = (inn.bowlers ?? []).map((bw: any) => ({
+      id: "es_" + (bw.bowler_id ?? bw.id ?? ""),
+      name: bw.name ?? "",
+      o: bw.overs ?? 0,
+      m: Number(bw.maidens ?? 0),
+      r: Number(bw.runs_conceded ?? 0),
+      w: Number(bw.wickets ?? 0),
+    }))
+
+    // EntitySport gives a dedicated fielder array — more reliable than parsing
+    // dismissal text.  Fields: catches, runout_thrower, runout_catcher,
+    // runout_direct_hit, stumping.  Dream11 credits runouts once per dismissal,
+    // so we count direct hits + (thrower+catcher sum, which together equal one
+    // runout).  For safety we pick max(thrower, catcher) to avoid double
+    // counting when both IDs point to the same runout.
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const catching = (inn.fielder ?? []).map((f: any) => {
+      const catches = Number(f.catches ?? 0)
+      const stumped = Number(f.stumping ?? 0)
+      const thrower = Number(f.runout_thrower ?? 0)
+      const catcher = Number(f.runout_catcher ?? 0)
+      const direct = Number(f.runout_direct_hit ?? 0)
+      const runouts = direct + Math.max(thrower, catcher)
+      return {
+        id: "es_" + (f.fielder_id ?? ""),
+        name: f.fielder_name ?? "",
+        catch: catches,
+        stumped,
+        runout: runouts,
+        cb: 0,
+      }
+    })
+
+    return {
+      inning: `${battingTeam} ${inningsId}`,
+      batting,
+      bowling,
+      catching,
+    }
+  })
+}
+
+async function tryEntitySportInfo(team1: string, team2: string, apiKey: string): Promise<unknown[] | null> {
+  try {
+    const headers = {
+      "x-rapidapi-key": apiKey,
+      "x-rapidapi-host": "cricket-live-line-advance.p.rapidapi.com",
+      "Content-Type": "application/json",
+    }
+
+    // Step A: find the EntitySport match_id for today's date that matches team names
+    const today = new Date().toISOString().slice(0, 10)
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    let allMatches: any[] = []
+    for (const url of [
+      `https://cricket-live-line-advance.p.rapidapi.com/matches?date=${today}`,
+      "https://cricket-live-line-advance.p.rapidapi.com/matches?status=live",
+      "https://cricket-live-line-advance.p.rapidapi.com/matches",
+    ]) {
+      try {
+        const r = await fetch(url, { headers, cache: "no-store" })
+        if (!r.ok) continue
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        const d: any = await r.json()
+        const arr = Array.isArray(d?.response?.items) ? d.response.items
+          : Array.isArray(d?.response) ? d.response
+          : Array.isArray(d?.data) ? d.data
+          : null
+        if (arr && arr.length > 0) { allMatches = arr; break }
+      } catch { continue }
+    }
+    if (allMatches.length === 0) return null
+
+    const tokens = (name: string): string[] => {
+      const parts = name.toLowerCase().split(/\s+/).filter(Boolean)
+      const toks = new Set<string>([name.toLowerCase(), ...parts])
+      if (parts.length >= 2) toks.add(parts.map(p => p[0]).join(""))
+      return Array.from(toks).filter(t => t.length >= 2)
+    }
+    const t1 = tokens(team1)
+    const t2 = tokens(team2)
+    const hits = (haystack: string, toks: string[]) =>
+      toks.some(t => haystack.includes(t))
+
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const found = allMatches.find((m: any) => {
+      const haystack = [
+        m.title ?? "", m.short_title ?? "",
+        m.teama?.name ?? "", m.teama?.short_name ?? "",
+        m.teamb?.name ?? "", m.teamb?.short_name ?? "",
+      ].join(" ").toLowerCase()
+      return hits(haystack, t1) && hits(haystack, t2)
+    })
+    if (!found) return null
+
+    const esMatchId = found.match_id ?? found.id
+    if (!esMatchId) return null
+
+    // Step B: fetch full info with scorecard
+    const infoRes = await fetch(
+      `https://cricket-live-line-advance.p.rapidapi.com/matches/${esMatchId}/info`,
+      { headers, cache: "no-store" }
+    )
+    if (!infoRes.ok) return null
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const infoData: any = await infoRes.json()
+
+    const innings = infoData?.response?.scorecard?.innings
+    if (!Array.isArray(innings) || innings.length === 0) return null
+
+    const converted = convertEntitySportScorecard(innings)
+
+    // Sanity: if conversion yielded no actual player entries, treat as not-found
+    // so callers fall through to other sources.
+    const hasPlayers = converted.some((inn: unknown) => {
+      const i = inn as { batting?: unknown[]; bowling?: unknown[] }
+      return (i.batting?.length ?? 0) > 0 || (i.bowling?.length ?? 0) > 0
+    })
+    if (!hasPlayers) return null
+
+    return converted
+  } catch {
+    return null
+  }
+}
+
+async function tryEntitySportDirect(matchId: string, team1: string, team2: string, apiKey: string): Promise<FetchResult | null> {
+  try {
+    const headers = {
+      "x-rapidapi-key": apiKey,
+      "x-rapidapi-host": "cricket-live-line-advance.p.rapidapi.com",
+      "Content-Type": "application/json",
+    }
+
+    // Find the match — try live first, then completed (status=3), then scheduled
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    let allMatches: any[] = []
+    for (const url of [
+      "https://cricket-live-line-advance.p.rapidapi.com/matches?status=2",   // live
+      "https://cricket-live-line-advance.p.rapidapi.com/livematches",
+      "https://cricket-live-line-advance.p.rapidapi.com/matches?status=3",   // completed
+      "https://cricket-live-line-advance.p.rapidapi.com/matches?status=live",
+      "https://cricket-live-line-advance.p.rapidapi.com/matches?status=1",   // scheduled (fallback)
+    ]) {
+      try {
+        const r = await fetch(url, { headers, cache: "no-store" })
+        if (!r.ok) continue
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        const d: any = await r.json()
+        const arr = Array.isArray(d) ? d
+          : Array.isArray(d?.response) ? d.response
+          : Array.isArray(d?.response?.items) ? d.response.items
+          : Array.isArray(d?.response?.data) ? d.response.data
+          : Array.isArray(d?.response?.matches) ? d.response.matches
+          : Array.isArray(d?.data) ? d.data
+          : null
+        if (arr && arr.length > 0) { allMatches = arr; break }
+      } catch { continue }
+    }
+
+    if (allMatches.length === 0) return null
+
+    // Build token sets for each team (first word, last word, full name) — any
+    // token hit counts.  Handles "Royal Challengers Bangalore" → matches feed
+    // listing it as "RCB", "Bangalore", "Challengers", or "Royal".
+    const tokens = (name: string): string[] => {
+      const parts = name.toLowerCase().split(/\s+/).filter(Boolean)
+      const toks = new Set<string>([name.toLowerCase(), ...parts])
+      // Acronym from initials, e.g. "Royal Challengers Bangalore" → "rcb"
+      if (parts.length >= 2) toks.add(parts.map(p => p[0]).join(""))
+      return Array.from(toks).filter(t => t.length >= 2)
+    }
+    const t1 = tokens(team1)
+    const t2 = tokens(team2)
+    const hits = (haystack: string, toks: string[]) =>
+      toks.some(t => haystack.includes(t))
+
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const found = allMatches.find((m: any) => {
+      const str = JSON.stringify(m).toLowerCase()
+      return hits(str, t1) && hits(str, t2)
+    })
+    if (!found) return null
+
+    const esMatchId = found.match_id ?? found.id ?? found.matchId
+    if (!esMatchId) return null
+
+    const ptsRes = await fetch(
+      `https://cricket-live-line-advance.p.rapidapi.com/matches/${esMatchId}/newpoint2`,
+      { headers, cache: "no-store" }
+    )
+    if (!ptsRes.ok) return null
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const ptsData: any = await ptsRes.json()
+
+    const pts = ptsData?.response?.points ?? ptsData?.points
+    if (!pts) return null
+
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const allPlayers: any[] = [
+      ...(pts.teama?.playing11 ?? []),
+      ...(pts.teamb?.playing11 ?? []),
+    ]
+    if (allPlayers.length === 0) return null
+
+    // Load existing DB players for name matching
+    const { data: dbPlayers } = await supabaseAdmin
+      .from("match_players")
+      .select("cricketdata_player_id, name")
+      .eq("match_id", matchId)
+    const dbList = (dbPlayers || []).map((p: { cricketdata_player_id: string; name: string }) => ({
+      id: p.cricketdata_player_id,
+      name: p.name,
+    }))
+
+    const now = new Date().toISOString()
+    let updated = 0
+
+    for (const player of allPlayers) {
+      const fantasyPoints = parseFloat(player.point ?? "0") || 0
+      if (fantasyPoints === 0) continue
+
+      const matched = dbList.find((p: { id: string; name: string }) =>
+        namesMatch(player.name, p.name)
+      )
+      if (!matched) continue
+
+      const { error } = await supabaseAdmin
+        .from("match_players")
+        .update({ fantasy_points: fantasyPoints, last_updated: now })
+        .eq("match_id", matchId)
+        .eq("cricketdata_player_id", matched.id)
+      if (!error) updated++
+    }
+
+    return { updated, total: allPlayers.length, remapped: 0, autoAdded: 0, missed: [] }
+  } catch {
+    return null
+  }
+}
+
 async function fetchAndSaveScores(matchId: string, cricketdataMatchId: string): Promise<FetchResult> {
+  // Fetch team names once upfront — used by Steps 2, 3, 4
+  const { data: matchRow } = await supabaseAdmin
+    .from("matches")
+    .select("team1, team2")
+    .eq("id", matchId)
+    .single()
+  const team1 = matchRow?.team1 ?? ""
+  const team2 = matchRow?.team2 ?? ""
+
   // Step 1: try the stored ID
   const r1 = await tryScorecard(cricketdataMatchId)
   let scorecard = r1.scorecard
@@ -142,14 +611,8 @@ async function fetchAndSaveScores(matchId: string, cricketdataMatchId: string): 
 
   // Step 2: if no scorecard and not definitively live/unstarted, search currentMatches
   if (!scorecard && !liveInProgress && !notStarted) {
-    const { data: matchRow } = await supabaseAdmin
-      .from("matches")
-      .select("team1, team2")
-      .eq("id", matchId)
-      .single()
-
-    if (matchRow) {
-      const foundId = await findLiveMatchId(matchRow.team1, matchRow.team2)
+    if (team1 && team2) {
+      const foundId = await findLiveMatchId(team1, team2)
       lastDetail += ` | currentMatches lookup: ${foundId ?? "not found"}`
 
       if (foundId) {
@@ -168,14 +631,63 @@ async function fetchAndSaveScores(matchId: string, cricketdataMatchId: string): 
     }
   }
 
-  if (!scorecard) {
-    if (liveInProgress) return { updated: 0, total: 0, remapped: 0, autoAdded: 0, missed: [], liveInProgress: true }
-    if (notStarted) return { updated: 0, total: 0, remapped: 0, autoAdded: 0, missed: [], notStarted: true }
-    throw new Error(`Scorecard unavailable. Debug: ${lastDetail}`)
+  // Step 3a: EntitySport /info fallback — PRIMARY live fallback.  cricapi sets
+  // fantasyEnabled:false during live play for some matches (e.g. RCB vs DC,
+  // SRH vs CSK), which means match_scorecard returns empty.  EntitySport's
+  // /matches/{id}/info returns a full raw scorecard (batting runs/balls/4s/6s,
+  // bowling overs/maidens/wickets, fielding catches/stumpings/runouts) which we
+  // feed into our own Dream11-style calculateFantasyPoints.
+  if (!scorecard && !notStarted && CRICBUZZ_API_KEY && team1 && team2) {
+    const esSc = await tryEntitySportInfo(team1, team2, CRICBUZZ_API_KEY)
+    if (esSc) {
+      scorecard = esSc
+      liveInProgress = false
+      lastDetail += " | entitysport-info: ok"
+    } else {
+      lastDetail += " | entitysport-info: not found"
+    }
   }
 
-  const result = await computeAndSave(matchId, scorecard)
-  return result
+  // Step 3b: Cricbuzz fallback — secondary, used when EntitySport /info can't
+  // find the match.  Currently on a BASIC plan so quota may be exhausted; still
+  // worth a try since it's free to attempt.
+  if (!scorecard && !notStarted && CRICBUZZ_API_KEY) {
+    if (team1 && team2) {
+      const cbSc = await tryCricbuzzScorecard(team1, team2, CRICBUZZ_API_KEY)
+      if (cbSc) {
+        scorecard = cbSc
+        liveInProgress = false
+        lastDetail += " | cricbuzz: ok"
+      } else {
+        lastDetail += " | cricbuzz: not found"
+      }
+    }
+  }
+
+  // Step 4: EntitySport — FINAL FALLBACK only, used when Steps 1-3 gave us no
+  // scorecard at all.  EntitySport's newpoint2 uses its own scoring formula
+  // which does NOT match our Dream11-style points (e.g. wickets worth 25 pts),
+  // so we must NOT let it override a correct scorecard computation.  Its only
+  // job is to provide *some* points when every other source is empty.
+  if (!scorecard && !notStarted && CRICBUZZ_API_KEY && team1 && team2) {
+    const esResult = await tryEntitySportDirect(matchId, team1, team2, CRICBUZZ_API_KEY)
+    if (esResult) {
+      lastDetail += ` | entitysport fallback: ${esResult.updated}/${esResult.total}`
+      return esResult
+    }
+    lastDetail += " | entitysport: not found"
+  }
+
+  // Primary path: compute Dream11 points from the raw scorecard
+  if (scorecard) {
+    const scorecardResult = await computeAndSave(matchId, scorecard)
+    lastDetail += ` | computeAndSave: ${scorecardResult.updated}/${scorecardResult.total}`
+    return scorecardResult
+  }
+
+  if (liveInProgress) return { updated: 0, total: 0, remapped: 0, autoAdded: 0, missed: [], liveInProgress: true }
+  if (notStarted) return { updated: 0, total: 0, remapped: 0, autoAdded: 0, missed: [], notStarted: true }
+  throw new Error(`Scorecard unavailable. Debug: ${lastDetail}`)
 }
 
 // ─── DB read helpers ──────────────────────────────────────────────────────────
@@ -220,7 +732,7 @@ export async function POST(req: NextRequest, { params }: { params: Promise<{ id:
       return NextResponse.json({
         success: false,
         liveInProgress: true,
-        error: "Match is currently live — player scores are updated by cricapi after each innings completes. Points will appear automatically once an innings ends.",
+        error: "Match is currently live — scores are refreshing automatically every 60 seconds. If points aren't showing yet, they'll appear shortly.",
         players,
       })
     }
@@ -271,8 +783,6 @@ export async function GET(req: NextRequest, { params }: { params: Promise<{ id: 
     .eq("id", id)
     .single()
 
-  let fetchError: string | null = null
-
   if (match?.status === "live" && match?.cricketdata_match_id) {
     const { data: lastPlayer } = await supabaseAdmin
       .from("match_players")
@@ -299,11 +809,5 @@ export async function GET(req: NextRequest, { params }: { params: Promise<{ id: 
   }
 
   const [players, teams] = await Promise.all([readPlayersFromDb(id), readTeamsFromDb(id)])
-
-  const hasScores = players.some((p: { fantasy_points?: number }) => (p.fantasy_points || 0) > 0)
-  return NextResponse.json({
-    players,
-    teams,
-    ...(fetchError && !hasScores ? { fetchError } : {}),
-  })
+  return NextResponse.json({ players, teams })
 }

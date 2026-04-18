@@ -131,9 +131,24 @@ export async function computeAndSave(matchId: string, scorecard: unknown[]): Pro
   )
   const updated = directResults.filter((r: { error: unknown }) => !r.error).length
 
-  // Name-based remaps: correct stored ID and save points
+  // Name-based remaps: correct stored ID and save points.
+  // Deduplicate by oldId first — an all-rounder can appear twice in pointsMap
+  // (once as batsman cb_ID_A, once as bowler cb_ID_B) but both name-match the
+  // same DB row whose current ID is oldId.  The first remap changes the DB row's
+  // cricketdata_player_id to cb_ID_A; the second then finds no row with oldId and
+  // the bowling points are silently lost.  Fix: merge all remaps for the same
+  // oldId into a single update with summed fantasy points.
+  const mergedRemaps = new Map<string, { oldId: string; newId: string; fantasyPoints: number }>()
+  for (const remap of idRemaps) {
+    if (mergedRemaps.has(remap.oldId)) {
+      mergedRemaps.get(remap.oldId)!.fantasyPoints += remap.fantasyPoints
+    } else {
+      mergedRemaps.set(remap.oldId, { ...remap })
+    }
+  }
+
   let remapped = 0
-  for (const { oldId, newId, fantasyPoints } of idRemaps) {
+  for (const { oldId, newId, fantasyPoints } of mergedRemaps.values()) {
     const { error } = await supabaseAdmin
       .from("match_players")
       .update({ cricketdata_player_id: newId, fantasy_points: fantasyPoints, last_updated: now })
@@ -142,8 +157,11 @@ export async function computeAndSave(matchId: string, scorecard: unknown[]): Pro
     if (!error) remapped++
   }
 
+  // Also fix up the idRemaps array so the team-repair loop below uses the merged list
+  const deduplicatedRemaps = Array.from(mergedRemaps.values())
+
   // Repair team player_ids / captain / vc that used old IDs
-  if (idRemaps.length > 0) {
+  if (deduplicatedRemaps.length > 0) {
     const { data: teamsData } = await supabaseAdmin
       .from("teams")
       .select("id, player_ids, captain_id, vice_captain_id")
@@ -155,7 +173,7 @@ export async function computeAndSave(matchId: string, scorecard: unknown[]): Pro
       let captainId: string = team.captain_id
       let vcId: string = team.vice_captain_id
 
-      for (const { oldId, newId } of idRemaps) {
+      for (const { oldId, newId } of deduplicatedRemaps) {
         if (playerIds.includes(oldId)) {
           playerIds = playerIds.map((pid: string) => (pid === oldId ? newId : pid))
           changed = true
