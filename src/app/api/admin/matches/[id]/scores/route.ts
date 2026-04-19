@@ -401,15 +401,28 @@ async function tryEntitySportInfo(team1: string, team2: string, apiKey: string):
       "Content-Type": "application/json",
     }
 
-    // Step A: find the EntitySport match_id for today's date that matches team names
-    const today = new Date().toISOString().slice(0, 10)
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    let allMatches: any[] = []
-    for (const url of [
-      `https://cricket-live-line-advance.p.rapidapi.com/matches?date=${today}`,
+    // Step A: find the EntitySport match_id that matches our team names.
+    //
+    // We AGGREGATE across multiple listing endpoints (don't break on first
+    // non-empty!). On 2026-04-19 live refresh was flaky because
+    // `/matches?date=today` would return today's matches *without* the
+    // currently-live one sometimes (their cache lags), we'd break out with a
+    // non-empty list, fail to find our match, and return null.  Merging across
+    // date/status/default endpoints + ±1 day window makes the lookup
+    // deterministic instead of dependent on which endpoint responded first.
+    const now = Date.now()
+    const dates = [0, -1, 1].map(d =>
+      new Date(now + d * 86_400_000).toISOString().slice(0, 10)
+    )
+    const listingUrls = [
+      ...dates.map(d => `https://cricket-live-line-advance.p.rapidapi.com/matches?date=${d}`),
       "https://cricket-live-line-advance.p.rapidapi.com/matches?status=live",
       "https://cricket-live-line-advance.p.rapidapi.com/matches",
-    ]) {
+    ]
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const allMatches: any[] = []
+    const seen = new Set<string>()
+    for (const url of listingUrls) {
       try {
         const r = await fetch(url, { headers, cache: "no-store" })
         if (!r.ok) continue
@@ -419,7 +432,14 @@ async function tryEntitySportInfo(team1: string, team2: string, apiKey: string):
           : Array.isArray(d?.response) ? d.response
           : Array.isArray(d?.data) ? d.data
           : null
-        if (arr && arr.length > 0) { allMatches = arr; break }
+        if (!arr) continue
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        for (const m of arr as any[]) {
+          const mid = String(m.match_id ?? m.id ?? "")
+          if (!mid || seen.has(mid)) continue
+          seen.add(mid)
+          allMatches.push(m)
+        }
       } catch { continue }
     }
     if (allMatches.length === 0) return null
