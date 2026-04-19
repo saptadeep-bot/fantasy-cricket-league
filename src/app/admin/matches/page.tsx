@@ -16,6 +16,16 @@ export default async function AdminMatchesPage() {
     .not("status", "eq", "abandoned")
     .order("scheduled_at", { ascending: true })
 
+  // Completed / abandoned — surfaced separately so admins can re-finalize
+  // or re-open a match if its scores were saved on bad data.  Most recent
+  // first, cap at 20 so the list doesn't grow unbounded across a season.
+  const { data: finishedMatches } = await supabaseAdmin
+    .from("matches")
+    .select("*")
+    .in("status", ["completed", "abandoned"])
+    .order("scheduled_at", { ascending: false })
+    .limit(20)
+
   return (
     <div className="min-h-screen bg-gray-950">
       <Navbar />
@@ -56,6 +66,33 @@ export default async function AdminMatchesPage() {
             <p className="text-gray-500 text-sm">No matches yet. Click &quot;Import&quot; above.</p>
           )}
         </div>
+
+        {finishedMatches && finishedMatches.length > 0 && (
+          <details className="mt-8 bg-gray-900 border border-gray-800 rounded-2xl p-4">
+            <summary className="cursor-pointer text-white font-semibold text-sm">
+              Completed &amp; abandoned ({finishedMatches.length})
+              <span className="text-gray-500 font-normal ml-2">— open to re-finalize if scores were wrong</span>
+            </summary>
+            <div className="space-y-2 mt-4">
+              {finishedMatches.map((m) => (
+                <a key={m.id} href={`/admin/matches/${m.id}`} className="bg-gray-950 border border-gray-800 rounded-xl p-3 flex items-center justify-between hover:border-gray-600 transition block">
+                  <div>
+                    <p className="text-white text-sm font-medium">{m.name}</p>
+                    <p className="text-gray-500 text-xs">
+                      {new Date(m.scheduled_at).toLocaleString("en-IN", { dateStyle: "medium", timeStyle: "short", timeZone: "Asia/Kolkata" })}
+                    </p>
+                  </div>
+                  <span className={`text-xs px-2 py-1 rounded-full font-medium ${
+                    m.status === "completed" ? "bg-gray-800 text-gray-400" :
+                    "bg-red-900 text-red-400"
+                  }`}>
+                    {m.status}
+                  </span>
+                </a>
+              ))}
+            </div>
+          </details>
+        )}
       </main>
     </div>
   )
