@@ -12,179 +12,19 @@
 //
 // The match status stays "completed" throughout — this is a correction, not a
 // re-opening of the match.
+//
+// HARDENED on 2026-04-18: the helper duplication between this file and
+// finalize/route.ts was lifted into `src/lib/scorecard-sources.ts`.  Both paths
+// now call the same `fetchBestScorecard` so they can't drift again.
 
 import { auth } from "@/auth"
 import { supabaseAdmin } from "@/lib/supabase"
 import { computeAndSave } from "@/lib/match-scoring"
 import { getEntryFee, calcPrizes } from "@/lib/prizes"
+import { fetchBestScorecard } from "@/lib/scorecard-sources"
 import { NextRequest, NextResponse } from "next/server"
 
 export const maxDuration = 60
-
-const CRICKETDATA_API_KEY = process.env.CRICKETDATA_API_KEY!
-const CRICBUZZ_API_KEY = process.env.CRICBUZZ_API_KEY
-
-// ─── Scorecard fetch (cricapi primary, EntitySport /info fallback) ───────────
-// Kept inline rather than importing from scores/route.ts because Next.js App
-// Router route files aren't meant to be imported from elsewhere.  The two paths
-// below cover the two cases we care about for a completed match:
-//   1. cricapi match_scorecard returns full data (fantasyEnabled:true after
-//      match ends) — this is the common case once the match has ended.
-//   2. EntitySport /matches/{id}/info returns a full raw scorecard which we
-//      convert to cricapi-compatible shape — backup if cricapi is still
-//      serving partial data.
-
-// eslint-disable-next-line @typescript-eslint/no-explicit-any
-function extractScorecard(data: any): unknown[] | null {
-  if (!data) return null
-  if (Array.isArray(data.data?.scorecard) && data.data.scorecard.length > 0) return data.data.scorecard
-  if (Array.isArray(data.data) && data.data.length > 0 && data.data[0]?.batting) return data.data
-  if (data.data?.batting || data.data?.bowling) return [data.data]
-  return null
-}
-
-async function fetchCricapiScorecard(cricketdataMatchId: string): Promise<unknown[] | null> {
-  try {
-    const res = await fetch(
-      `https://api.cricapi.com/v1/match_scorecard?apikey=${CRICKETDATA_API_KEY}&id=${cricketdataMatchId}`,
-      { cache: "no-store" }
-    )
-    const data = await res.json()
-    if (data.status !== "success") return null
-    return extractScorecard(data)
-  } catch {
-    return null
-  }
-}
-
-// eslint-disable-next-line @typescript-eslint/no-explicit-any
-function convertEntitySportScorecard(innings: any[]): unknown[] {
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  return innings.map((inn: any) => {
-    const battingTeam = inn.name ?? "Unknown"
-    const inningsId = inn.number ?? 1
-
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    const batting = (inn.batsmen ?? []).map((b: any) => ({
-      id: "es_" + (b.batsman_id ?? b.id ?? ""),
-      name: b.name ?? "",
-      r: Number(b.runs ?? 0),
-      b: Number(b.balls_faced ?? 0),
-      "4s": Number(b.fours ?? 0),
-      "6s": Number(b.sixes ?? 0),
-      "dismissal-text": b.how_out ?? "",
-      dismissal: b.how_out ?? "",
-    }))
-
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    const bowling = (inn.bowlers ?? []).map((bw: any) => ({
-      id: "es_" + (bw.bowler_id ?? bw.id ?? ""),
-      name: bw.name ?? "",
-      o: bw.overs ?? 0,
-      m: Number(bw.maidens ?? 0),
-      r: Number(bw.runs_conceded ?? 0),
-      w: Number(bw.wickets ?? 0),
-    }))
-
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    const catching = (inn.fielder ?? []).map((f: any) => {
-      const catches = Number(f.catches ?? 0)
-      const stumped = Number(f.stumping ?? 0)
-      const thrower = Number(f.runout_thrower ?? 0)
-      const catcher = Number(f.runout_catcher ?? 0)
-      const direct = Number(f.runout_direct_hit ?? 0)
-      return {
-        id: "es_" + (f.fielder_id ?? ""),
-        name: f.fielder_name ?? "",
-        catch: catches,
-        stumped,
-        runout: direct + Math.max(thrower, catcher),
-        cb: 0,
-      }
-    })
-
-    return { inning: `${battingTeam} ${inningsId}`, batting, bowling, catching }
-  })
-}
-
-async function fetchEntitySportScorecard(team1: string, team2: string): Promise<unknown[] | null> {
-  if (!CRICBUZZ_API_KEY) return null
-  try {
-    const headers = {
-      "x-rapidapi-key": CRICBUZZ_API_KEY,
-      "x-rapidapi-host": "cricket-live-line-advance.p.rapidapi.com",
-      "Content-Type": "application/json",
-    }
-
-    // Search a few dates around today to handle matches that ended yesterday
-    const now = Date.now()
-    const dates = [0, -1, -2].map(d =>
-      new Date(now + d * 86_400_000).toISOString().slice(0, 10)
-    )
-
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    let allMatches: any[] = []
-    for (const date of dates) {
-      try {
-        const r = await fetch(
-          `https://cricket-live-line-advance.p.rapidapi.com/matches?date=${date}`,
-          { headers, cache: "no-store" }
-        )
-        if (!r.ok) continue
-        // eslint-disable-next-line @typescript-eslint/no-explicit-any
-        const d: any = await r.json()
-        const arr = Array.isArray(d?.response?.items) ? d.response.items : null
-        if (arr) allMatches.push(...arr)
-      } catch { continue }
-    }
-    if (allMatches.length === 0) return null
-
-    const tokens = (name: string): string[] => {
-      const parts = name.toLowerCase().split(/\s+/).filter(Boolean)
-      const toks = new Set<string>([name.toLowerCase(), ...parts])
-      if (parts.length >= 2) toks.add(parts.map(p => p[0]).join(""))
-      return Array.from(toks).filter(t => t.length >= 2)
-    }
-    const t1 = tokens(team1)
-    const t2 = tokens(team2)
-    const hits = (haystack: string, toks: string[]) =>
-      toks.some(t => haystack.includes(t))
-
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    const found = allMatches.find((m: any) => {
-      const haystack = [
-        m.title ?? "", m.short_title ?? "",
-        m.teama?.name ?? "", m.teama?.short_name ?? "",
-        m.teamb?.name ?? "", m.teamb?.short_name ?? "",
-      ].join(" ").toLowerCase()
-      return hits(haystack, t1) && hits(haystack, t2)
-    })
-    if (!found) return null
-
-    const esMatchId = found.match_id ?? found.id
-    if (!esMatchId) return null
-
-    const infoRes = await fetch(
-      `https://cricket-live-line-advance.p.rapidapi.com/matches/${esMatchId}/info`,
-      { headers, cache: "no-store" }
-    )
-    if (!infoRes.ok) return null
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    const infoData: any = await infoRes.json()
-
-    const innings = infoData?.response?.scorecard?.innings
-    if (!Array.isArray(innings) || innings.length === 0) return null
-
-    const converted = convertEntitySportScorecard(innings)
-    const hasPlayers = converted.some((inn: unknown) => {
-      const i = inn as { batting?: unknown[]; bowling?: unknown[] }
-      return (i.batting?.length ?? 0) > 0 || (i.bowling?.length ?? 0) > 0
-    })
-    return hasPlayers ? converted : null
-  } catch {
-    return null
-  }
-}
 
 // ─── Handler ─────────────────────────────────────────────────────────────────
 export async function POST(req: NextRequest, { params }: { params: Promise<{ id: string }> }) {
@@ -203,13 +43,15 @@ export async function POST(req: NextRequest, { params }: { params: Promise<{ id:
   if (!match) return NextResponse.json({ error: "Match not found" }, { status: 404 })
 
   try {
-    // Step 1: Fetch scorecard — try cricapi first (richest format), then EntitySport
-    let scorecard = await fetchCricapiScorecard(match.cricketdata_match_id)
-    let source = "cricapi"
-    if (!scorecard || scorecard.length === 0) {
-      scorecard = await fetchEntitySportScorecard(match.team1 ?? "", match.team2 ?? "")
-      source = "entitysport-info"
-    }
+    // Step 1: Fetch scorecard from the richest available source (cricapi and
+    // EntitySport /info tried in parallel, richer one wins).  Same helper as
+    // finalize/route.ts — they MUST stay in sync or we're right back to the
+    // partial-data bug this endpoint was built to fix.
+    const { scorecard, source } = await fetchBestScorecard(
+      match.cricketdata_match_id,
+      match.team1 ?? "",
+      match.team2 ?? "",
+    )
     if (!scorecard || scorecard.length === 0) {
       return NextResponse.json({
         error: "Could not fetch a full scorecard from any source. Try again in a few minutes.",
