@@ -83,7 +83,38 @@ export default function ScoreControls({ match }: { match: Match }) {
     router.refresh()
   }
 
+  async function refinalizeMatch() {
+    if (!confirm(
+      "Re-finalize this completed match?\n\n" +
+      "This will:\n" +
+      "• Re-fetch the final scorecard\n" +
+      "• Recompute every player's fantasy points\n" +
+      "• Re-rank all teams\n" +
+      "• Rewrite prize amounts in the ledger\n\n" +
+      "Settled payouts will stay marked settled. " +
+      "Use this ONLY if the original finalize ran on incomplete data."
+    )) return
+    setLoading("refinalize")
+    setMessage(null)
+    const data = await callApi(`/api/admin/matches/${match.id}/refinalize`)
+    if (data.success) {
+      const winners = data.results
+        ?.filter((r: { prize_won: number }) => r.prize_won > 0)
+        .map((r: { prize_won: number; rank: number }) => `#${r.rank}: ₹${r.prize_won}`).join(", ")
+      setMessage(
+        `Re-finalized from ${data.source}. ${data.computeResult?.updated ?? 0}/${data.computeResult?.total ?? 0} player scores updated. ` +
+        `Prizes: ${winners || "No payouts"}`
+      )
+    } else {
+      setMessage(`Error: ${data.error}`)
+    }
+    setLoading(null)
+    router.refresh()
+  }
+
   if (match.status === "upcoming") return null
+
+  const isCompleted = match.status === "completed"
 
   return (
     <div className="bg-gray-900 border border-gray-800 rounded-2xl p-5 space-y-4">
@@ -125,6 +156,16 @@ export default function ScoreControls({ match }: { match: Match }) {
             className="bg-red-900 text-red-300 font-semibold px-4 py-2 rounded-xl text-sm hover:bg-red-800 transition disabled:opacity-50"
           >
             Mark Abandoned
+          </button>
+        )}
+        {isCompleted && (
+          <button
+            onClick={refinalizeMatch}
+            disabled={!!loading}
+            className="bg-purple-700 text-white font-semibold px-4 py-2 rounded-xl text-sm hover:bg-purple-600 transition disabled:opacity-50"
+            title="Re-fetch the scorecard and recompute all player points + prizes. Use if the original finalize ran on incomplete data."
+          >
+            {loading === "refinalize" ? "Re-finalizing…" : "Re-finalize (fix scores)"}
           </button>
         )}
       </div>
