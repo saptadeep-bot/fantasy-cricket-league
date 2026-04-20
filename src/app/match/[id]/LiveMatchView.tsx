@@ -123,10 +123,17 @@ export default function LiveMatchView({
     }
   }, [livePlayers])
 
-  // Auto-poll: triggers API fetch on server if >90s stale, then returns DB data
+  // Auto-poll: triggers API fetch on server if >45s stale, then returns DB data.
+  // cache:no-store + ?t=cache-buster are both needed — without them, browsers
+  // (especially mobile Safari) heuristically cache the GET response and replay
+  // it for minutes without ever hitting the server.  That manifested on
+  // 2026-04-20 as fantasy points frozen for 15+ min on the participant view
+  // while admin POST refresh worked fine (POST is never browser-cached).
   const fetchLiveScores = useCallback(async () => {
     try {
-      const res = await fetch(`/api/admin/matches/${match.id}/scores`)
+      const res = await fetch(`/api/admin/matches/${match.id}/scores?t=${Date.now()}`, {
+        cache: "no-store",
+      })
       const data = await res.json()
       if (data.players) {
         setLivePlayers(data.players)
@@ -148,7 +155,9 @@ export default function LiveMatchView({
     setRefreshing(true)
     setRefreshError(null)
     try {
-      const res = await fetch(`/api/admin/matches/${match.id}/scores?refresh=1`)
+      const res = await fetch(`/api/admin/matches/${match.id}/scores?refresh=1&t=${Date.now()}`, {
+        cache: "no-store",
+      })
       const data = await res.json()
       if (data.error) {
         setRefreshError(data.error)

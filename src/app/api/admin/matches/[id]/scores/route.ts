@@ -4,6 +4,19 @@ import { computeAndSave, namesMatch } from "@/lib/match-scoring"
 import { NextRequest, NextResponse } from "next/server"
 
 export const maxDuration = 60
+// Force dynamic rendering so Next.js never statically caches this handler's
+// output at build time or via its data cache.  We also set Cache-Control:
+// no-store on every response below — together these stop browsers, Vercel's
+// edge cache, and any intermediate proxy from replaying stale responses to
+// the participant auto-poll (which was the 2026-04-20 frozen-scores bug).
+export const dynamic = "force-dynamic"
+export const revalidate = 0
+
+const NO_CACHE_HEADERS = {
+  "Cache-Control": "no-store, no-cache, must-revalidate, max-age=0",
+  "Pragma": "no-cache",
+  "Expires": "0",
+} as const
 
 const CRICKETDATA_API_KEY = process.env.CRICKETDATA_API_KEY!
 const CRICBUZZ_API_KEY = process.env.CRICBUZZ_API_KEY
@@ -733,7 +746,7 @@ export async function POST(req: NextRequest, { params }: { params: Promise<{ id:
   const { id } = await params
   const session = await auth()
   if (!session?.user?.is_admin) {
-    return NextResponse.json({ error: "Unauthorized" }, { status: 401 })
+    return NextResponse.json({ error: "Unauthorized" }, { status: 401, headers: NO_CACHE_HEADERS })
   }
 
   const { data: match } = await supabaseAdmin
@@ -742,7 +755,7 @@ export async function POST(req: NextRequest, { params }: { params: Promise<{ id:
     .eq("id", id)
     .single()
 
-  if (!match) return NextResponse.json({ error: "Match not found" }, { status: 404 })
+  if (!match) return NextResponse.json({ error: "Match not found" }, { status: 404, headers: NO_CACHE_HEADERS })
 
   try {
     const result = await fetchAndSaveScores(id, match.cricketdata_match_id)
@@ -754,7 +767,7 @@ export async function POST(req: NextRequest, { params }: { params: Promise<{ id:
         liveInProgress: true,
         error: "Match is currently live — scores are refreshing automatically every 60 seconds. If points aren't showing yet, they'll appear shortly.",
         players,
-      })
+      }, { headers: NO_CACHE_HEADERS })
     }
 
     if (result.notStarted) {
@@ -764,7 +777,7 @@ export async function POST(req: NextRequest, { params }: { params: Promise<{ id:
         notStarted: true,
         error: "Match hasn't started yet. Scores will be available once the match begins.",
         players,
-      })
+      }, { headers: NO_CACHE_HEADERS })
     }
 
     const players = await readPlayersFromDb(id)
@@ -773,9 +786,9 @@ export async function POST(req: NextRequest, { params }: { params: Promise<{ id:
       result.remapped > 0 ? `${result.remapped} ID remapped` : "",
       result.autoAdded > 0 ? `${result.autoAdded} new player(s) added (${result.missed.length === 0 ? "OK" : result.missed.join(", ")})` : "",
     ].filter(Boolean).join(". ")
-    return NextResponse.json({ success: true, players, ...result, message: msg })
+    return NextResponse.json({ success: true, players, ...result, message: msg }, { headers: NO_CACHE_HEADERS })
   } catch (err) {
-    return NextResponse.json({ error: String(err).replace(/^Error:\s*/, "") }, { status: 400 })
+    return NextResponse.json({ error: String(err).replace(/^Error:\s*/, "") }, { status: 400, headers: NO_CACHE_HEADERS })
   }
 }
 
@@ -785,7 +798,7 @@ export async function POST(req: NextRequest, { params }: { params: Promise<{ id:
 export async function GET(req: NextRequest, { params }: { params: Promise<{ id: string }> }) {
   const { id } = await params
   const session = await auth()
-  if (!session) return NextResponse.json({ error: "Unauthorized" }, { status: 401 })
+  if (!session) return NextResponse.json({ error: "Unauthorized" }, { status: 401, headers: NO_CACHE_HEADERS })
 
   const url = new URL(req.url)
   const isParticipantRefresh =
@@ -793,7 +806,7 @@ export async function GET(req: NextRequest, { params }: { params: Promise<{ id: 
 
   if (isParticipantRefresh) {
     const [players, teams] = await Promise.all([readPlayersFromDb(id), readTeamsFromDb(id)])
-    return NextResponse.json({ players, teams })
+    return NextResponse.json({ players, teams }, { headers: NO_CACHE_HEADERS })
   }
 
   // Auto-poll: fetch from API if data is stale (>45 seconds)
@@ -829,5 +842,5 @@ export async function GET(req: NextRequest, { params }: { params: Promise<{ id: 
   }
 
   const [players, teams] = await Promise.all([readPlayersFromDb(id), readTeamsFromDb(id)])
-  return NextResponse.json({ players, teams })
+  return NextResponse.json({ players, teams }, { headers: NO_CACHE_HEADERS })
 }
