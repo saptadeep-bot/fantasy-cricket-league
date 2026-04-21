@@ -809,38 +809,42 @@ export async function GET(req: NextRequest, { params }: { params: Promise<{ id: 
     return NextResponse.json({ players, teams }, { headers: NO_CACHE_HEADERS })
   }
 
-  // Auto-poll: fetch from API if data is stale (>45 seconds)
+  // Auto-poll: ALWAYS fetch from external APIs during live (no staleness
+  // throttle).  Previous behaviour was to skip the fetch when DB had been
+  // updated in the last 45s, but that caused lockouts during the 2026-04-20
+  // live match when admin POST kept `last_updated` warm while auto-poll
+  // silently returned the SAME snapshot over and over.  The client polls
+  // every 60s so the load is bounded and external quotas are unaffected.
   const { data: match } = await supabaseAdmin
     .from("matches")
     .select("status, cricketdata_match_id")
     .eq("id", id)
     .single()
 
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const debug: Record<string, any> = {
+    matchStatus: match?.status ?? null,
+    hasCricketdataId: !!match?.cricketdata_match_id,
+    fetchAttempted: false,
+    fetchResult: null,
+    fetchError: null,
+  }
+
   if (match?.status === "live" && match?.cricketdata_match_id) {
-    const { data: lastPlayer } = await supabaseAdmin
-      .from("match_players")
-      .select("last_updated")
-      .eq("match_id", id)
-      .not("last_updated", "is", null)
-      .order("last_updated", { ascending: false })
-      .limit(1)
-      .single()
-
-    const lastUpdated = lastPlayer?.last_updated ? new Date(lastPlayer.last_updated) : null
-    const isStale = !lastUpdated || lastUpdated < new Date(Date.now() - 45_000)
-
-    if (isStale) {
-      try {
-        await fetchAndSaveScores(id, match.cricketdata_match_id)
-        // Any result (including liveInProgress/notStarted) is fine — never set fetchError during live
-      } catch {
-        // Match is live per our DB — API failures mid-innings are expected.
-        // Silently swallow the error and keep polling every 60s.
-        // Scores will appear automatically once cricapi has the scorecard ready.
+    debug.fetchAttempted = true
+    try {
+      const r = await fetchAndSaveScores(id, match.cricketdata_match_id)
+      debug.fetchResult = {
+        updated: r.updated,
+        total: r.total,
+        liveInProgress: r.liveInProgress ?? false,
+        notStarted: r.notStarted ?? false,
       }
+    } catch (e) {
+      debug.fetchError = String(e).replace(/^Error:\s*/, "").slice(0, 400)
     }
   }
 
   const [players, teams] = await Promise.all([readPlayersFromDb(id), readTeamsFromDb(id)])
-  return NextResponse.json({ players, teams }, { headers: NO_CACHE_HEADERS })
+  return NextResponse.json({ players, teams, _debug: debug }, { headers: NO_CACHE_HEADERS })
 }

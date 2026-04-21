@@ -112,6 +112,8 @@ export default function LiveMatchView({
   const [refreshError, setRefreshError] = useState<string | null>(null)
   const [pollError, setPollError] = useState<string | null>(null)
   const [apiLastUpdated, setApiLastUpdated] = useState<Date | null>(null)
+  const [debugInfo, setDebugInfo] = useState<string | null>(null)
+  const [pollTick, setPollTick] = useState<Date | null>(null)
 
   // Derive API last-updated time from the player data (when DB was last written by API)
   useEffect(() => {
@@ -144,6 +146,21 @@ export default function LiveMatchView({
         setPollError(data.fetchError)
       } else {
         setPollError(null)
+      }
+      setPollTick(new Date())
+      if (data._debug) {
+        const d = data._debug
+        const parts: string[] = []
+        parts.push(`status:${d.matchStatus}`)
+        if (d.fetchAttempted) {
+          if (d.fetchError) parts.push(`err:${String(d.fetchError).slice(0, 80)}`)
+          else if (d.fetchResult?.liveInProgress) parts.push(`live_in_progress`)
+          else if (d.fetchResult?.notStarted) parts.push(`not_started`)
+          else parts.push(`fetched:${d.fetchResult?.updated ?? "?"}/${d.fetchResult?.total ?? "?"}`)
+        } else {
+          parts.push("no_fetch")
+        }
+        setDebugInfo(parts.join(" | "))
       }
     } catch {
       // Network error — keep retrying silently
@@ -267,6 +284,11 @@ export default function LiveMatchView({
                     )}
                     {pollError && !refreshError && (
                       <p className="text-orange-400 text-xs mt-1">⚠ {pollError}</p>
+                    )}
+                    {debugInfo && (
+                      <p className="text-gray-600 text-[10px] mt-1 font-mono break-all text-right">
+                        {pollTick && `poll ${pollTick.toLocaleTimeString("en-IN", { hour: "2-digit", minute: "2-digit", second: "2-digit", timeZone: "Asia/Kolkata" })} · `}{debugInfo}
+                      </p>
                     )}
                   </div>
                 )}
