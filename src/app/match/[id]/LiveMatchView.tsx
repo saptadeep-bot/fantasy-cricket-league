@@ -156,7 +156,10 @@ export default function LiveMatchView({
           if (d.fetchError) parts.push(`err:${String(d.fetchError).slice(0, 80)}`)
           else if (d.fetchResult?.liveInProgress) parts.push(`live_in_progress`)
           else if (d.fetchResult?.notStarted) parts.push(`not_started`)
-          else parts.push(`fetched:${d.fetchResult?.updated ?? "?"}/${d.fetchResult?.total ?? "?"}`)
+          else {
+            const src = d.fetchResult?.source ? ` src:${String(d.fetchResult.source).slice(0, 40)}` : ""
+            parts.push(`fetched:${d.fetchResult?.updated ?? "?"}/${d.fetchResult?.total ?? "?"}${src}`)
+          }
         } else {
           parts.push("no_fetch")
         }

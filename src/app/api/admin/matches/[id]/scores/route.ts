@@ -114,6 +114,20 @@ interface FetchResult {
   missed: string[]
   liveInProgress?: boolean
   notStarted?: boolean
+  source?: string
+  lastDetail?: string
+}
+
+// Count batters + bowlers across all innings in a converted scorecard.  Used
+// to pick the richer source when both cricapi and EntitySport return data.
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+function countScorecardPlayers(scorecard: any[]): number {
+  let n = 0
+  for (const inn of scorecard || []) {
+    n += (inn.batting?.length ?? 0)
+    n += (inn.bowling?.length ?? 0)
+  }
+  return n
 }
 
 async function findLiveMatchId(team1: string, team2: string): Promise<string | null> {
@@ -638,6 +652,7 @@ async function fetchAndSaveScores(matchId: string, cricketdataMatchId: string): 
   // Step 1: try the stored ID
   const r1 = await tryScorecard(cricketdataMatchId)
   let scorecard = r1.scorecard
+  let source = scorecard ? "cricapi" : ""
   let lastDetail = `stored ID (${cricketdataMatchId}): ${r1.detail}`
   let liveInProgress = r1.liveInProgress ?? false
   let notStarted = r1.notStarted ?? false
@@ -657,6 +672,7 @@ async function fetchAndSaveScores(matchId: string, cricketdataMatchId: string): 
         }
         const r2 = await tryScorecard(foundId)
         scorecard = r2.scorecard
+        if (scorecard) source = "cricapi-remap"
         liveInProgress = r2.liveInProgress ?? false
         notStarted = r2.notStarted ?? false
         lastDetail += ` | retry (${foundId}): ${r2.detail}`
@@ -664,18 +680,31 @@ async function fetchAndSaveScores(matchId: string, cricketdataMatchId: string): 
     }
   }
 
-  // Step 3a: EntitySport /info fallback — PRIMARY live fallback.  cricapi sets
-  // fantasyEnabled:false during live play for some matches (e.g. RCB vs DC,
-  // SRH vs CSK), which means match_scorecard returns empty.  EntitySport's
-  // /matches/{id}/info returns a full raw scorecard (batting runs/balls/4s/6s,
-  // bowling overs/maidens/wickets, fielding catches/stumpings/runouts) which we
-  // feed into our own Dream11-style calculateFantasyPoints.
-  if (!scorecard && !notStarted && CRICBUZZ_API_KEY && team1 && team2) {
-    const esSc = await tryEntitySportInfo(team1, team2, CRICBUZZ_API_KEY)
-    if (esSc) {
+  // Step 3a: EntitySport /info — PRIMARY live fallback.
+  //
+  // We also run this when cricapi gave us a THIN scorecard (<15 batter+bowler
+  // entries across both innings).  Reason: mid-match cricapi sometimes flips
+  // fantasyEnabled:true but populates the scorecard player-by-player — so
+  // we'd lock onto a partial 10-player view and never see the full picture
+  // even as the match progressed.  That was the 2026-04-21 live-refresh bug.
+  // EntitySport's /matches/{id}/info returns a full raw scorecard (batting
+  // runs/balls/4s/6s, bowling overs/maidens/wickets, fielding
+  // catches/stumpings/runouts) which we feed into calculateFantasyPoints.
+  const cricapiCount = scorecard ? countScorecardPlayers(scorecard) : 0
+  const shouldTryEntitySport = (!scorecard || cricapiCount < 15) && !notStarted && CRICBUZZ_API_KEY && team1 && team2
+  if (shouldTryEntitySport) {
+    const esSc = await tryEntitySportInfo(team1, team2, CRICBUZZ_API_KEY!)
+    const esCount = esSc ? countScorecardPlayers(esSc) : 0
+    if (esSc && esCount > cricapiCount) {
+      // EntitySport has more players — use it
       scorecard = esSc
+      source = `entitysport-info (es ${esCount} vs cricapi ${cricapiCount})`
       liveInProgress = false
-      lastDetail += " | entitysport-info: ok"
+      lastDetail += ` | entitysport-info: ok (${esCount} players, richer than cricapi ${cricapiCount})`
+    } else if (esSc) {
+      lastDetail += ` | entitysport-info: ${esCount} players (cricapi ${cricapiCount} already richer, keeping cricapi)`
+    } else if (scorecard) {
+      lastDetail += ` | entitysport-info: not found (keeping thin cricapi ${cricapiCount})`
     } else {
       lastDetail += " | entitysport-info: not found"
     }
@@ -689,6 +718,7 @@ async function fetchAndSaveScores(matchId: string, cricketdataMatchId: string): 
       const cbSc = await tryCricbuzzScorecard(team1, team2, CRICBUZZ_API_KEY)
       if (cbSc) {
         scorecard = cbSc
+        source = "cricbuzz"
         liveInProgress = false
         lastDetail += " | cricbuzz: ok"
       } else {
@@ -706,7 +736,7 @@ async function fetchAndSaveScores(matchId: string, cricketdataMatchId: string): 
     const esResult = await tryEntitySportDirect(matchId, team1, team2, CRICBUZZ_API_KEY)
     if (esResult) {
       lastDetail += ` | entitysport fallback: ${esResult.updated}/${esResult.total}`
-      return esResult
+      return { ...esResult, source: "entitysport-newpoint2", lastDetail }
     }
     lastDetail += " | entitysport: not found"
   }
@@ -715,11 +745,11 @@ async function fetchAndSaveScores(matchId: string, cricketdataMatchId: string): 
   if (scorecard) {
     const scorecardResult = await computeAndSave(matchId, scorecard)
     lastDetail += ` | computeAndSave: ${scorecardResult.updated}/${scorecardResult.total}`
-    return scorecardResult
+    return { ...scorecardResult, source, lastDetail }
   }
 
-  if (liveInProgress) return { updated: 0, total: 0, remapped: 0, autoAdded: 0, missed: [], liveInProgress: true }
-  if (notStarted) return { updated: 0, total: 0, remapped: 0, autoAdded: 0, missed: [], notStarted: true }
+  if (liveInProgress) return { updated: 0, total: 0, remapped: 0, autoAdded: 0, missed: [], liveInProgress: true, lastDetail }
+  if (notStarted) return { updated: 0, total: 0, remapped: 0, autoAdded: 0, missed: [], notStarted: true, lastDetail }
   throw new Error(`Scorecard unavailable. Debug: ${lastDetail}`)
 }
 
@@ -839,7 +869,9 @@ export async function GET(req: NextRequest, { params }: { params: Promise<{ id: 
         total: r.total,
         liveInProgress: r.liveInProgress ?? false,
         notStarted: r.notStarted ?? false,
+        source: r.source ?? null,
       }
+      if (r.lastDetail) debug.lastDetail = r.lastDetail.slice(0, 500)
     } catch (e) {
       debug.fetchError = String(e).replace(/^Error:\s*/, "").slice(0, 400)
     }
