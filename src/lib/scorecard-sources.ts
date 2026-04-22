@@ -1,14 +1,16 @@
 /**
- * Shared scorecard-fetching helpers.
+ * Shared scorecard-fetching helpers — the single source of truth for every
+ * path that needs a scorecard (live auto-poll, admin Refresh, finalize,
+ * refinalize).
  *
- * Used by both `/finalize` and `/refinalize` so the two endpoints can't drift
- * and leave one of them vulnerable to the partial-cricapi bug we hit on
- * 2026-04-18 (finalize ran on incomplete data while Cricbuzz quota was out).
- *
- * The live-poll path in `/scores/route.ts` has its own inline copies of these
- * helpers.  Kept separate deliberately: it has extra live-specific branches
- * (liveInProgress, notStarted, currentMatches retry) that finalize doesn't
- * need, and the live path is hot & proven — not worth the refactor risk.
+ * Before 2026-04-22 the live-poll path in `/scores/route.ts` kept its own
+ * inline copies of these helpers.  The duplicates drifted twice in the span
+ * of a week (once for ±1-day date windows, once for listing aggregation) and
+ * the live path broke while finalize was still fine.  On 2026-04-22 we
+ * consolidated: there is now ONE set of helpers here.  The live path wraps
+ * `fetchBestScorecardLive()` (which layers match-state detection on top of
+ * `fetchBestScorecard`) and retains only its truly live-specific extras
+ * (cricapi ID remap via `currentMatches`, and the `newpoint2` last-resort).
  *
  * Source preference:
  *   1. cricapi `match_scorecard` — richest format, contains batsman/bowler
@@ -18,14 +20,49 @@
  *      `response.scorecard.innings[]`.  We convert field names to the
  *      cricapi shape so `calculateFantasyPoints()` can consume it uniformly.
  *
- * The final source (Cricbuzz /scard) is NOT included here.  That host's
- * monthly quota has been exhausted for this subscription tier — scores/route
- * keeps it only as a "free attempt" for the live path.  For finalize, where
- * we want bulletproof data, we skip it.
+ * Both sources are ALWAYS fetched in parallel — whichever returned more
+ * batter+bowler entries wins.  This defends against partial cricapi data
+ * during the window where `fantasyEnabled` has flipped to true but the
+ * scorecard is still populating player-by-player (the 2026-04-21 bug).
+ *
+ * Cricbuzz `/scard` is NOT included here.  That host's monthly quota has
+ * been exhausted for this subscription tier — the live route keeps it only
+ * as a "free attempt" fallback.  For finalize, where we want bulletproof
+ * data, we skip it.
  */
 
 const CRICKETDATA_API_KEY = process.env.CRICKETDATA_API_KEY!
-const CRICBUZZ_API_KEY = process.env.CRICBUZZ_API_KEY // used for EntitySport host too
+const CRICBUZZ_API_KEY = process.env.CRICBUZZ_API_KEY // same key covers EntitySport host
+
+// ─── Timeout helper ───────────────────────────────────────────────────────────
+// Every external call has a bounded timeout.  Auto-poll fires every 60s and the
+// Vercel function cap is 60s, so a hanging upstream could freeze a poll cycle.
+//
+// NOTE on 2026-04-22: originally set to 8s.  That was too tight — EntitySport's
+// `/info` endpoint regularly takes 10-15s under load, and aborting at 8s
+// silently dropped us back to "no scorecard" → `live_in_progress` with nothing
+// visible in the UI.  20s gives real APIs room to breathe while still being a
+// hard cap on dead connections.  With 6 possible EntitySport calls (5 listings
+// + 1 info), worst case is 120s — far exceeds maxDuration, but in practice
+// they're never all slow at once, and a short-circuit on the first successful
+// listing keeps the typical case well under 30s.
+const DEFAULT_TIMEOUT_MS = 20_000
+
+async function timedFetch(
+  input: string,
+  init?: RequestInit,
+  ms = DEFAULT_TIMEOUT_MS
+): Promise<Response | null> {
+  const ac = new AbortController()
+  const t = setTimeout(() => ac.abort(), ms)
+  try {
+    return await fetch(input, { ...init, signal: ac.signal })
+  } catch {
+    return null
+  } finally {
+    clearTimeout(t)
+  }
+}
 
 // ─── cricapi ──────────────────────────────────────────────────────────────────
 
@@ -35,15 +72,18 @@ function extractScorecard(data: any): unknown[] | null {
   if (Array.isArray(data.data?.scorecard) && data.data.scorecard.length > 0) return data.data.scorecard
   if (Array.isArray(data.data) && data.data.length > 0 && data.data[0]?.batting) return data.data
   if (data.data?.batting || data.data?.bowling) return [data.data]
+  if (Array.isArray(data.data?.cards) && data.data.cards.length > 0) return data.data.cards
+  if (Array.isArray(data.data?.innings) && data.data.innings.length > 0) return data.data.innings
   return null
 }
 
 export async function fetchCricapiScorecard(cricketdataMatchId: string): Promise<unknown[] | null> {
   try {
-    const res = await fetch(
+    const res = await timedFetch(
       `https://api.cricapi.com/v1/match_scorecard?apikey=${CRICKETDATA_API_KEY}&id=${cricketdataMatchId}`,
       { cache: "no-store" }
     )
+    if (!res) return null
     const data = await res.json()
     if (data.status !== "success") return null
     return extractScorecard(data)
@@ -52,23 +92,46 @@ export async function fetchCricapiScorecard(cricketdataMatchId: string): Promise
   }
 }
 
+export interface CricapiMatchInfo {
+  matchStarted: boolean
+  matchEnded: boolean
+  fantasyEnabled: boolean
+  bbbEnabled: boolean
+}
+
 /**
- * Cheap check — does cricapi think this match has ended?  Used as a soft
- * signal: if `matchEnded:false` AND we just pulled a thin scorecard, we should
- * prefer EntitySport over cricapi because cricapi may still be populating.
+ * Fetch cricapi match_info and return the flags the live-poll path cares
+ * about (started / ended / fantasyEnabled).  Returns null on any failure so
+ * callers can treat state as unknown.
  */
-export async function isCricapiMatchEnded(cricketdataMatchId: string): Promise<boolean | null> {
+export async function fetchCricapiMatchInfo(cricketdataMatchId: string): Promise<CricapiMatchInfo | null> {
   try {
-    const res = await fetch(
+    const res = await timedFetch(
       `https://api.cricapi.com/v1/match_info?apikey=${CRICKETDATA_API_KEY}&id=${cricketdataMatchId}`,
       { cache: "no-store" }
     )
+    if (!res) return null
     const data = await res.json()
     if (data.status !== "success") return null
-    return !!data.data?.matchEnded
+    const d = data.data ?? {}
+    return {
+      matchStarted: !!d.matchStarted,
+      matchEnded: !!d.matchEnded,
+      fantasyEnabled: !!d.fantasyEnabled,
+      bbbEnabled: !!d.bbbEnabled,
+    }
   } catch {
     return null
   }
+}
+
+/**
+ * Back-compat soft signal: cricapi's view of "did this match end?".  Prefer
+ * `fetchCricapiMatchInfo` for new code — it also exposes matchStarted.
+ */
+export async function isCricapiMatchEnded(cricketdataMatchId: string): Promise<boolean | null> {
+  const info = await fetchCricapiMatchInfo(cricketdataMatchId)
+  return info ? info.matchEnded : null
 }
 
 // ─── EntitySport ──────────────────────────────────────────────────────────────
@@ -140,26 +203,45 @@ export async function fetchEntitySportScorecard(team1: string, team2: string): P
       "Content-Type": "application/json",
     }
 
-    // Search a 3-day window (today + previous two) so finalize can find
-    // matches that ended late last night IST.
+    // Aggregate across multiple listing endpoints — don't break on first
+    // non-empty!  EntitySport's caches lag at different rates across endpoints
+    // (date-listing vs live-listing vs default-listing).  Missing the
+    // currently-live match from one listing has bitten us before (commit
+    // 7241093 re-introduced a `break` that caused flaky live refresh).
+    //
+    // Date window is ±1 day in UTC — covers matches that start late evening
+    // IST (crosses UTC midnight) and matches that roll past UTC midnight.
     const now = Date.now()
-    const dates = [0, -1, -2].map(d =>
+    const dates = [0, -1, 1].map(d =>
       new Date(now + d * 86_400_000).toISOString().slice(0, 10)
     )
+    const listingUrls = [
+      ...dates.map(d => `https://cricket-live-line-advance.p.rapidapi.com/matches?date=${d}`),
+      "https://cricket-live-line-advance.p.rapidapi.com/matches?status=live",
+      "https://cricket-live-line-advance.p.rapidapi.com/matches",
+    ]
 
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     const allMatches: any[] = []
-    for (const date of dates) {
+    const seen = new Set<string>()
+    for (const url of listingUrls) {
+      const r = await timedFetch(url, { headers, cache: "no-store" })
+      if (!r || !r.ok) continue
       try {
-        const r = await fetch(
-          `https://cricket-live-line-advance.p.rapidapi.com/matches?date=${date}`,
-          { headers, cache: "no-store" }
-        )
-        if (!r.ok) continue
         // eslint-disable-next-line @typescript-eslint/no-explicit-any
         const d: any = await r.json()
-        const arr = Array.isArray(d?.response?.items) ? d.response.items : null
-        if (arr) allMatches.push(...arr)
+        const arr = Array.isArray(d?.response?.items) ? d.response.items
+          : Array.isArray(d?.response) ? d.response
+          : Array.isArray(d?.data) ? d.data
+          : null
+        if (!arr) continue
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        for (const m of arr as any[]) {
+          const mid = String(m.match_id ?? m.id ?? "")
+          if (!mid || seen.has(mid)) continue
+          seen.add(mid)
+          allMatches.push(m)
+        }
       } catch { continue }
     }
     if (allMatches.length === 0) return null
@@ -189,11 +271,11 @@ export async function fetchEntitySportScorecard(team1: string, team2: string): P
     const esMatchId = found.match_id ?? found.id
     if (!esMatchId) return null
 
-    const infoRes = await fetch(
+    const infoRes = await timedFetch(
       `https://cricket-live-line-advance.p.rapidapi.com/matches/${esMatchId}/info`,
       { headers, cache: "no-store" }
     )
-    if (!infoRes.ok) return null
+    if (!infoRes || !infoRes.ok) return null
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     const infoData: any = await infoRes.json()
 
@@ -236,6 +318,10 @@ export function countScorecardPlayers(scorecard: any[]): number {
  *
  * The `source` string is for logging/debugging (e.g. "cricapi" or
  * "entitysport-info" or "cricapi (richer)").
+ *
+ * Used by finalize/refinalize — they don't need match-state detection so they
+ * call this directly.  Live-poll uses `fetchBestScorecardLive` which layers
+ * match-state detection on top of this.
  */
 export async function fetchBestScorecard(
   cricketdataMatchId: string,
@@ -259,4 +345,74 @@ export async function fetchBestScorecard(
   // fielding).
   if (cricapiN + 2 >= esN) return { scorecard: cricapiRes, source: `cricapi (${cricapiN} vs es ${esN})` }
   return { scorecard: esRes, source: `entitysport-info (${esN} vs cricapi ${cricapiN})` }
+}
+
+// ─── Live-aware variant ──────────────────────────────────────────────────────
+
+export interface LiveScorecardResult {
+  scorecard: unknown[] | null
+  source: string
+  /** True when the match is in progress AND we couldn't get any scorecard —
+   * caller should show "live, waiting for scores" rather than an error. */
+  liveInProgress: boolean
+  /** True when the match hasn't started yet AND we have no scorecard. */
+  notStarted: boolean
+  /** Single-string summary of what happened across all sources.  Safe to log
+   * or display — includes counts and state flags for diagnostics. */
+  detail: string
+}
+
+/**
+ * Live-poll entry point.  Fetches cricapi scorecard + cricapi match_info +
+ * EntitySport scorecard all in parallel, picks the richer of the two
+ * scorecards, and layers match-state detection (liveInProgress / notStarted)
+ * on top for the case where both sources returned nothing.
+ *
+ * Invariant: `liveInProgress` and `notStarted` are only true when `scorecard`
+ * is null.  If we have any scorecard, we return it and leave those flags
+ * false — the caller will display the scores.
+ */
+export async function fetchBestScorecardLive(
+  cricketdataMatchId: string,
+  team1: string,
+  team2: string
+): Promise<LiveScorecardResult> {
+  const [cricapiSc, cricapiInfo, esSc] = await Promise.all([
+    fetchCricapiScorecard(cricketdataMatchId),
+    fetchCricapiMatchInfo(cricketdataMatchId),
+    fetchEntitySportScorecard(team1, team2),
+  ])
+
+  const cricapiN = cricapiSc ? countScorecardPlayers(cricapiSc as unknown[]) : 0
+  const esN = esSc ? countScorecardPlayers(esSc as unknown[]) : 0
+
+  let scorecard: unknown[] | null = null
+  let source = "none"
+  if (cricapiSc && esSc) {
+    // Both present — pick richer.  Tie / within-2 goes to cricapi (native
+    // shape, better fielding data).
+    if (cricapiN + 2 >= esN) {
+      scorecard = cricapiSc
+      source = `cricapi (${cricapiN} vs es ${esN})`
+    } else {
+      scorecard = esSc
+      source = `entitysport-info (es ${esN} vs cricapi ${cricapiN})`
+    }
+  } else if (cricapiSc) {
+    scorecard = cricapiSc
+    source = `cricapi (${cricapiN})`
+  } else if (esSc) {
+    scorecard = esSc
+    source = `entitysport-info (${esN})`
+  }
+
+  const liveInProgress = !scorecard && !!cricapiInfo && cricapiInfo.matchStarted && !cricapiInfo.matchEnded
+  const notStarted = !scorecard && !!cricapiInfo && !cricapiInfo.matchStarted
+
+  const infoStr = cricapiInfo
+    ? `info:started=${cricapiInfo.matchStarted},ended=${cricapiInfo.matchEnded},fantasy=${cricapiInfo.fantasyEnabled}`
+    : "info:unavailable"
+  const detail = `cricapi:${cricapiN} | es:${esN} | ${infoStr} | source:${source}`
+
+  return { scorecard, source, liveInProgress, notStarted, detail }
 }

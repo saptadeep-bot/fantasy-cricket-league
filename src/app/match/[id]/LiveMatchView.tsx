@@ -153,13 +153,17 @@ export default function LiveMatchView({
         const parts: string[] = []
         parts.push(`status:${d.matchStatus}`)
         if (d.fetchAttempted) {
-          if (d.fetchError) parts.push(`err:${String(d.fetchError).slice(0, 80)}`)
+          if (d.fetchError) parts.push(`err:${String(d.fetchError).slice(0, 120)}`)
           else if (d.fetchResult?.liveInProgress) parts.push(`live_in_progress`)
           else if (d.fetchResult?.notStarted) parts.push(`not_started`)
           else {
             const src = d.fetchResult?.source ? ` src:${String(d.fetchResult.source).slice(0, 40)}` : ""
             parts.push(`fetched:${d.fetchResult?.updated ?? "?"}/${d.fetchResult?.total ?? "?"}${src}`)
           }
+          // Always append lastDetail when present — it's the only way to
+          // diagnose live_in_progress / "both sources empty" situations
+          // without firing the admin POST.
+          if (d.lastDetail) parts.push(String(d.lastDetail).slice(0, 300))
         } else {
           parts.push("no_fetch")
         }
