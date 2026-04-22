@@ -192,9 +192,31 @@ function convertEntitySportScorecard(innings: any[]): unknown[] {
   })
 }
 
-export async function fetchEntitySportScorecard(team1: string, team2: string): Promise<unknown[] | null> {
-  if (!CRICBUZZ_API_KEY) return null
-  if (!team1 || !team2) return null
+/**
+ * Detailed variant — returns both the scorecard (or null) and a short human-
+ * readable `reason` string explaining the outcome.  The reason is threaded
+ * into `fetchBestScorecardLive`'s detail string so we can diagnose WHY
+ * EntitySport returned nothing without needing to tail Vercel logs.
+ *
+ * Reason categories:
+ *   - `no_api_key` / `no_teams` — configuration
+ *   - `no_listings` — every listing URL returned empty / failed
+ *   - `listed_N_no_team_match (sample: ...)` — N matches found in listings,
+ *     but no haystack contained both team tokens.  Sample gives the first
+ *     haystack so we can eyeball the naming mismatch.
+ *   - `matched_<id>_info_http_error` — found the match, /info endpoint failed
+ *   - `matched_<id>_no_innings` — found the match, /info returned no innings
+ *     (normal before ball 1; seeing this mid-match means EntitySport lagged)
+ *   - `matched_<id>_empty_players` — innings present but no batters/bowlers
+ *   - `ok_<count>` — success
+ *   - `error: <msg>` — exception path
+ */
+export async function fetchEntitySportScorecardDetailed(
+  team1: string,
+  team2: string
+): Promise<{ scorecard: unknown[] | null; reason: string }> {
+  if (!CRICBUZZ_API_KEY) return { scorecard: null, reason: "no_api_key" }
+  if (!team1 || !team2) return { scorecard: null, reason: "no_teams" }
 
   try {
     const headers = {
@@ -244,7 +266,7 @@ export async function fetchEntitySportScorecard(team1: string, team2: string): P
         }
       } catch { continue }
     }
-    if (allMatches.length === 0) return null
+    if (allMatches.length === 0) return { scorecard: null, reason: "no_listings" }
 
     const tokens = (name: string): string[] => {
       const parts = name.toLowerCase().split(/\s+/).filter(Boolean)
@@ -258,39 +280,67 @@ export async function fetchEntitySportScorecard(team1: string, team2: string): P
       toks.some(t => haystack.includes(t))
 
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const buildHaystack = (m: any) => [
+      m.title ?? "", m.short_title ?? "",
+      m.teama?.name ?? "", m.teama?.short_name ?? "",
+      m.teamb?.name ?? "", m.teamb?.short_name ?? "",
+    ].join(" ").toLowerCase()
+
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
     const found = allMatches.find((m: any) => {
-      const haystack = [
-        m.title ?? "", m.short_title ?? "",
-        m.teama?.name ?? "", m.teama?.short_name ?? "",
-        m.teamb?.name ?? "", m.teamb?.short_name ?? "",
-      ].join(" ").toLowerCase()
+      const haystack = buildHaystack(m)
       return hits(haystack, t1) && hits(haystack, t2)
     })
-    if (!found) return null
+    if (!found) {
+      // Surface the first couple of short_titles so we can see how today's
+      // match is actually named in EntitySport's feed — crucial for diagnosing
+      // team-name tokenization misses (e.g. "Bangalore" vs "Bengaluru").
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const sample = allMatches.slice(0, 3).map((m: any) => m.short_title ?? m.title ?? "?").join("; ")
+      return {
+        scorecard: null,
+        reason: `listed_${allMatches.length}_no_team_match (t1=${t1.join(",")};t2=${t2.join(",")};sample=${sample})`,
+      }
+    }
 
     const esMatchId = found.match_id ?? found.id
-    if (!esMatchId) return null
+    if (!esMatchId) return { scorecard: null, reason: "matched_but_no_id" }
 
     const infoRes = await timedFetch(
       `https://cricket-live-line-advance.p.rapidapi.com/matches/${esMatchId}/info`,
       { headers, cache: "no-store" }
     )
-    if (!infoRes || !infoRes.ok) return null
+    if (!infoRes || !infoRes.ok) {
+      const code = infoRes ? infoRes.status : "timeout"
+      return { scorecard: null, reason: `matched_${esMatchId}_info_http_${code}` }
+    }
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     const infoData: any = await infoRes.json()
 
     const innings = infoData?.response?.scorecard?.innings
-    if (!Array.isArray(innings) || innings.length === 0) return null
+    if (!Array.isArray(innings) || innings.length === 0) {
+      return { scorecard: null, reason: `matched_${esMatchId}_no_innings` }
+    }
 
     const converted = convertEntitySportScorecard(innings)
-    const hasPlayers = converted.some((inn: unknown) => {
+    const playerCount = converted.reduce((sum: number, inn: unknown) => {
       const i = inn as { batting?: unknown[]; bowling?: unknown[] }
-      return (i.batting?.length ?? 0) > 0 || (i.bowling?.length ?? 0) > 0
-    })
-    return hasPlayers ? converted : null
-  } catch {
-    return null
+      return sum + (i.batting?.length ?? 0) + (i.bowling?.length ?? 0)
+    }, 0)
+    if (playerCount === 0) {
+      return { scorecard: null, reason: `matched_${esMatchId}_empty_players` }
+    }
+    return { scorecard: converted, reason: `ok_${playerCount}` }
+  } catch (e) {
+    return { scorecard: null, reason: `error:${String(e).slice(0, 60)}` }
   }
+}
+
+// Back-compat wrapper — used by finalize/refinalize which don't need the
+// reason string.  New callers should prefer `fetchEntitySportScorecardDetailed`.
+export async function fetchEntitySportScorecard(team1: string, team2: string): Promise<unknown[] | null> {
+  const r = await fetchEntitySportScorecardDetailed(team1, team2)
+  return r.scorecard
 }
 
 // ─── Quality checks ───────────────────────────────────────────────────────────
@@ -377,12 +427,13 @@ export async function fetchBestScorecardLive(
   team1: string,
   team2: string
 ): Promise<LiveScorecardResult> {
-  const [cricapiSc, cricapiInfo, esSc] = await Promise.all([
+  const [cricapiSc, cricapiInfo, esDetailed] = await Promise.all([
     fetchCricapiScorecard(cricketdataMatchId),
     fetchCricapiMatchInfo(cricketdataMatchId),
-    fetchEntitySportScorecard(team1, team2),
+    fetchEntitySportScorecardDetailed(team1, team2),
   ])
 
+  const esSc = esDetailed.scorecard
   const cricapiN = cricapiSc ? countScorecardPlayers(cricapiSc as unknown[]) : 0
   const esN = esSc ? countScorecardPlayers(esSc as unknown[]) : 0
 
@@ -412,7 +463,9 @@ export async function fetchBestScorecardLive(
   const infoStr = cricapiInfo
     ? `info:started=${cricapiInfo.matchStarted},ended=${cricapiInfo.matchEnded},fantasy=${cricapiInfo.fantasyEnabled}`
     : "info:unavailable"
-  const detail = `cricapi:${cricapiN} | es:${esN} | ${infoStr} | source:${source}`
+  // Include the EntitySport reason — this is the data we need to diagnose
+  // "es:0" failures without fishing through Vercel logs.
+  const detail = `cricapi:${cricapiN} | es:${esN} (${esDetailed.reason}) | ${infoStr} | source:${source}`
 
   return { scorecard, source, liveInProgress, notStarted, detail }
 }
