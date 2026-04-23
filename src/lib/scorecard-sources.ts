@@ -211,109 +211,123 @@ function convertEntitySportScorecard(innings: any[]): unknown[] {
  *   - `ok_<count>` — success
  *   - `error: <msg>` — exception path
  */
+// ─── EntitySport listing resolver (shared) ───────────────────────────────────
+// Given our stored team1/team2 names, find the corresponding EntitySport
+// match_id by aggregating multiple listing endpoints and tokenising team names.
+// Used by BOTH the scorecard fetcher AND the squad fetcher — don't inline a
+// second copy here (it drifted once already, commit fdaf8fe).
+export async function resolveEntitySportMatchId(
+  team1: string,
+  team2: string,
+): Promise<{ esMatchId: string | null; reason: string }> {
+  if (!CRICBUZZ_API_KEY) return { esMatchId: null, reason: "no_api_key" }
+  if (!team1 || !team2) return { esMatchId: null, reason: "no_teams" }
+
+  const headers = {
+    "x-rapidapi-key": CRICBUZZ_API_KEY,
+    "x-rapidapi-host": "cricket-live-line-advance.p.rapidapi.com",
+    "Content-Type": "application/json",
+  }
+
+  // Aggregate across multiple listing endpoints — don't break on first
+  // non-empty!  EntitySport's caches lag at different rates across endpoints
+  // (date-listing vs live-listing vs default-listing).  Missing the
+  // currently-live match from one listing has bitten us before (commit
+  // 7241093 re-introduced a `break` that caused flaky live refresh).
+  //
+  // Date window is ±1 day in UTC — covers matches that start late evening
+  // IST (crosses UTC midnight) and matches that roll past UTC midnight.
+  const now = Date.now()
+  const dates = [0, -1, 1].map(d =>
+    new Date(now + d * 86_400_000).toISOString().slice(0, 10)
+  )
+  const listingUrls = [
+    ...dates.map(d => `https://cricket-live-line-advance.p.rapidapi.com/matches?date=${d}`),
+    "https://cricket-live-line-advance.p.rapidapi.com/matches?status=live",
+    "https://cricket-live-line-advance.p.rapidapi.com/matches",
+  ]
+
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const allMatches: any[] = []
+  const seen = new Set<string>()
+  const statuses: string[] = []
+  for (const url of listingUrls) {
+    const r = await timedFetch(url, { headers, cache: "no-store" })
+    if (!r) { statuses.push("TO"); continue }
+    if (!r.ok) { statuses.push(String(r.status)); continue }
+    try {
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const d: any = await r.json()
+      const arr = Array.isArray(d?.response?.items) ? d.response.items
+        : Array.isArray(d?.response) ? d.response
+        : Array.isArray(d?.data) ? d.data
+        : null
+      if (!arr) { statuses.push("200-noarr"); continue }
+      statuses.push(`200-${arr.length}`)
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      for (const m of arr as any[]) {
+        const mid = String(m.match_id ?? m.id ?? "")
+        if (!mid || seen.has(mid)) continue
+        seen.add(mid)
+        allMatches.push(m)
+      }
+    } catch { statuses.push("json-err") }
+  }
+  if (allMatches.length === 0) {
+    return { esMatchId: null, reason: `no_listings [${statuses.join(",")}]` }
+  }
+
+  const tokens = (name: string): string[] => {
+    const parts = name.toLowerCase().split(/\s+/).filter(Boolean)
+    const toks = new Set<string>([name.toLowerCase(), ...parts])
+    if (parts.length >= 2) toks.add(parts.map(p => p[0]).join(""))
+    return Array.from(toks).filter(t => t.length >= 2)
+  }
+  const t1 = tokens(team1)
+  const t2 = tokens(team2)
+  const hits = (haystack: string, toks: string[]) =>
+    toks.some(t => haystack.includes(t))
+
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const buildHaystack = (m: any) => [
+    m.title ?? "", m.short_title ?? "",
+    m.teama?.name ?? "", m.teama?.short_name ?? "",
+    m.teamb?.name ?? "", m.teamb?.short_name ?? "",
+  ].join(" ").toLowerCase()
+
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const found = allMatches.find((m: any) => {
+    const haystack = buildHaystack(m)
+    return hits(haystack, t1) && hits(haystack, t2)
+  })
+  if (!found) {
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const sample = allMatches.slice(0, 3).map((m: any) => m.short_title ?? m.title ?? "?").join("; ")
+    return {
+      esMatchId: null,
+      reason: `listed_${allMatches.length}_no_team_match (t1=${t1.join(",")};t2=${t2.join(",")};sample=${sample})`,
+    }
+  }
+
+  const esMatchId = found.match_id ?? found.id
+  if (!esMatchId) return { esMatchId: null, reason: "matched_but_no_id" }
+  return { esMatchId: String(esMatchId), reason: `ok_found_${esMatchId}` }
+}
+
 export async function fetchEntitySportScorecardDetailed(
   team1: string,
   team2: string
 ): Promise<{ scorecard: unknown[] | null; reason: string }> {
-  if (!CRICBUZZ_API_KEY) return { scorecard: null, reason: "no_api_key" }
-  if (!team1 || !team2) return { scorecard: null, reason: "no_teams" }
+  const resolved = await resolveEntitySportMatchId(team1, team2)
+  if (!resolved.esMatchId) return { scorecard: null, reason: resolved.reason }
+  const esMatchId = resolved.esMatchId
 
   try {
     const headers = {
-      "x-rapidapi-key": CRICBUZZ_API_KEY,
+      "x-rapidapi-key": CRICBUZZ_API_KEY!,
       "x-rapidapi-host": "cricket-live-line-advance.p.rapidapi.com",
       "Content-Type": "application/json",
     }
-
-    // Aggregate across multiple listing endpoints — don't break on first
-    // non-empty!  EntitySport's caches lag at different rates across endpoints
-    // (date-listing vs live-listing vs default-listing).  Missing the
-    // currently-live match from one listing has bitten us before (commit
-    // 7241093 re-introduced a `break` that caused flaky live refresh).
-    //
-    // Date window is ±1 day in UTC — covers matches that start late evening
-    // IST (crosses UTC midnight) and matches that roll past UTC midnight.
-    const now = Date.now()
-    const dates = [0, -1, 1].map(d =>
-      new Date(now + d * 86_400_000).toISOString().slice(0, 10)
-    )
-    const listingUrls = [
-      ...dates.map(d => `https://cricket-live-line-advance.p.rapidapi.com/matches?date=${d}`),
-      "https://cricket-live-line-advance.p.rapidapi.com/matches?status=live",
-      "https://cricket-live-line-advance.p.rapidapi.com/matches",
-    ]
-
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    const allMatches: any[] = []
-    const seen = new Set<string>()
-    // Track per-URL outcome so `no_listings` tells us whether it was quota
-    // (429 everywhere), outage (5xx / timeout), or a response-shape change
-    // (200-noarr).
-    const statuses: string[] = []
-    for (const url of listingUrls) {
-      const r = await timedFetch(url, { headers, cache: "no-store" })
-      if (!r) { statuses.push("TO"); continue }
-      if (!r.ok) { statuses.push(String(r.status)); continue }
-      try {
-        // eslint-disable-next-line @typescript-eslint/no-explicit-any
-        const d: any = await r.json()
-        const arr = Array.isArray(d?.response?.items) ? d.response.items
-          : Array.isArray(d?.response) ? d.response
-          : Array.isArray(d?.data) ? d.data
-          : null
-        if (!arr) { statuses.push("200-noarr"); continue }
-        statuses.push(`200-${arr.length}`)
-        // eslint-disable-next-line @typescript-eslint/no-explicit-any
-        for (const m of arr as any[]) {
-          const mid = String(m.match_id ?? m.id ?? "")
-          if (!mid || seen.has(mid)) continue
-          seen.add(mid)
-          allMatches.push(m)
-        }
-      } catch { statuses.push("json-err") }
-    }
-    if (allMatches.length === 0) {
-      return { scorecard: null, reason: `no_listings [${statuses.join(",")}]` }
-    }
-
-    const tokens = (name: string): string[] => {
-      const parts = name.toLowerCase().split(/\s+/).filter(Boolean)
-      const toks = new Set<string>([name.toLowerCase(), ...parts])
-      if (parts.length >= 2) toks.add(parts.map(p => p[0]).join(""))
-      return Array.from(toks).filter(t => t.length >= 2)
-    }
-    const t1 = tokens(team1)
-    const t2 = tokens(team2)
-    const hits = (haystack: string, toks: string[]) =>
-      toks.some(t => haystack.includes(t))
-
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    const buildHaystack = (m: any) => [
-      m.title ?? "", m.short_title ?? "",
-      m.teama?.name ?? "", m.teama?.short_name ?? "",
-      m.teamb?.name ?? "", m.teamb?.short_name ?? "",
-    ].join(" ").toLowerCase()
-
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    const found = allMatches.find((m: any) => {
-      const haystack = buildHaystack(m)
-      return hits(haystack, t1) && hits(haystack, t2)
-    })
-    if (!found) {
-      // Surface the first couple of short_titles so we can see how today's
-      // match is actually named in EntitySport's feed — crucial for diagnosing
-      // team-name tokenization misses (e.g. "Bangalore" vs "Bengaluru").
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      const sample = allMatches.slice(0, 3).map((m: any) => m.short_title ?? m.title ?? "?").join("; ")
-      return {
-        scorecard: null,
-        reason: `listed_${allMatches.length}_no_team_match (t1=${t1.join(",")};t2=${t2.join(",")};sample=${sample})`,
-      }
-    }
-
-    const esMatchId = found.match_id ?? found.id
-    if (!esMatchId) return { scorecard: null, reason: "matched_but_no_id" }
-
     const infoRes = await timedFetch(
       `https://cricket-live-line-advance.p.rapidapi.com/matches/${esMatchId}/info`,
       { headers, cache: "no-store" }
@@ -341,6 +355,114 @@ export async function fetchEntitySportScorecardDetailed(
     return { scorecard: converted, reason: `ok_${playerCount}` }
   } catch (e) {
     return { scorecard: null, reason: `error:${String(e).slice(0, 60)}` }
+  }
+}
+
+// ─── EntitySport squad fetcher ───────────────────────────────────────────────
+// Pulls the full squad (including impact substitutes) from EntitySport's
+// `/matches/{id}/info` response.  Cricapi's `/match_squad` regularly misses
+// named impact-sub-pool players (e.g. G Linde vs LSG on 2026-04-22) — this
+// is our primary way of catching them.
+//
+// Shape of the useful bit of the `/info` response:
+//   response.squads.teama.squads[] = [{ player_id, name, role, playing11, substitute }, ...]
+//   response.squads.teamb.squads[] = same
+//   response.teama.name / response.teamb.name = full team name
+//
+// We map EntitySport roles to our 4-bucket scheme (BAT/BOWL/ALL/WK) and
+// return each player tagged with its team name.  IDs come through as raw
+// EntitySport `player_id` strings — the caller is responsible for deciding
+// how to merge them with cricapi IDs (usually: name-match, prefer cricapi).
+
+export interface EntitySportSquadPlayer {
+  es_player_id: string
+  name: string
+  team: string
+  role: "BAT" | "BOWL" | "ALL" | "WK"
+  es_substitute: boolean   // true if EntitySport tagged them as impact-sub
+  es_playing11: boolean    // true if EntitySport tagged them as in announced XI
+}
+
+function mapEntitySportRole(role: string): "BAT" | "BOWL" | "ALL" | "WK" {
+  const r = (role || "").toLowerCase()
+  if (r.includes("wk") || r.includes("wicket")) return "WK"
+  if (r.includes("all")) return "ALL"
+  if (r.includes("bowl")) return "BOWL"
+  if (r.includes("bat")) return "BAT"
+  return "BAT"
+}
+
+export async function fetchEntitySportSquadDetailed(
+  team1: string,
+  team2: string,
+): Promise<{ players: EntitySportSquadPlayer[] | null; reason: string }> {
+  const resolved = await resolveEntitySportMatchId(team1, team2)
+  if (!resolved.esMatchId) return { players: null, reason: resolved.reason }
+  const esMatchId = resolved.esMatchId
+
+  try {
+    const headers = {
+      "x-rapidapi-key": CRICBUZZ_API_KEY!,
+      "x-rapidapi-host": "cricket-live-line-advance.p.rapidapi.com",
+      "Content-Type": "application/json",
+    }
+    const infoRes = await timedFetch(
+      `https://cricket-live-line-advance.p.rapidapi.com/matches/${esMatchId}/info`,
+      { headers, cache: "no-store" }
+    )
+    if (!infoRes || !infoRes.ok) {
+      const code = infoRes ? infoRes.status : "timeout"
+      return { players: null, reason: `matched_${esMatchId}_info_http_${code}` }
+    }
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const infoData: any = await infoRes.json()
+
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const teama = infoData?.response?.squads?.teama as any
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const teamb = infoData?.response?.squads?.teamb as any
+
+    // Team names — prefer the top-level teama/teamb.name (matches our stored
+    // DB team names when cricapi & EntitySport use the same convention), but
+    // fall back to the nested squads object if needed.
+    const teamAName = infoData?.response?.teama?.name
+      ?? teama?.name
+      ?? team1
+    const teamBName = infoData?.response?.teamb?.name
+      ?? teamb?.name
+      ?? team2
+
+    const out: EntitySportSquadPlayer[] = []
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const pushSquad = (squadObj: any, teamName: string) => {
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const arr: any[] = squadObj?.squads ?? squadObj?.players ?? []
+      for (const p of arr) {
+        const pid = String(p.player_id ?? p.pid ?? "")
+        const name = String(p.name ?? p.title ?? "").trim()
+        if (!pid || !name) continue
+        // EntitySport encodes booleans as strings ("true"/"false") — normalise.
+        const sub = String(p.substitute ?? "").toLowerCase() === "true"
+        const playing11 = String(p.playing11 ?? "").toLowerCase() === "true"
+        out.push({
+          es_player_id: pid,
+          name,
+          team: teamName,
+          role: mapEntitySportRole(p.role ?? p.playing_role ?? ""),
+          es_substitute: sub,
+          es_playing11: playing11,
+        })
+      }
+    }
+    pushSquad(teama, teamAName)
+    pushSquad(teamb, teamBName)
+
+    if (out.length === 0) {
+      return { players: null, reason: `matched_${esMatchId}_empty_squads` }
+    }
+    return { players: out, reason: `ok_${out.length}` }
+  } catch (e) {
+    return { players: null, reason: `error:${String(e).slice(0, 60)}` }
   }
 }
 

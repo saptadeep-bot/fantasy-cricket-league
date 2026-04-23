@@ -50,6 +50,15 @@ export default function LockMatchPanel({
   const [message, setMessage] = useState<string | null>(null)
   const [squadSaved, setSquadSaved] = useState(existingPlayers.length > 0)
 
+  // Manual "Add missing player" form state — safety valve for players that
+  // neither cricapi nor EntitySport return (happens for late-named impact
+  // subs like G Linde on 2026-04-22).
+  const [showAddPlayer, setShowAddPlayer] = useState(false)
+  const [addName, setAddName] = useState("")
+  const [addTeam, setAddTeam] = useState("")
+  const [addRole, setAddRole] = useState<"BAT" | "BOWL" | "ALL" | "WK">("BAT")
+  const [addingPlayer, setAddingPlayer] = useState(false)
+
   const alreadyLocked = match.status !== "upcoming"
 
   async function fetchSquad() {
@@ -63,7 +72,14 @@ export default function LockMatchPanel({
         // Preserve any existing is_playing selections
         setSelectedXI(new Set(existingPlayers.filter(p => p.is_playing).map(p => p.cricketdata_player_id)))
         setSquadSaved(true)
-        setMessage(`Saved ${data.players.length} players. Friends can now pick their teams!`)
+        const c = data.counts ?? {}
+        const breakdown = [
+          typeof c.total === "number" ? `${c.total} total` : null,
+          c.inserted ? `+${c.inserted} new` : null,
+          c.entitysportOnly ? `${c.entitysportOnly} from EntitySport` : null,
+          c.preserved ? `${c.preserved} preserved` : null,
+        ].filter(Boolean).join(", ")
+        setMessage(`Squad updated (${breakdown}). Friends can pick their teams!`)
       } else {
         setMessage(`Error: ${data.error}`)
       }
@@ -71,6 +87,36 @@ export default function LockMatchPanel({
       setMessage("Network error")
     } finally {
       setLoading(false)
+    }
+  }
+
+  async function addMissingPlayer() {
+    const name = addName.trim()
+    const team = addTeam || match.team1
+    if (!name) { setMessage("Enter a player name"); return }
+    setAddingPlayer(true)
+    setMessage(null)
+    try {
+      const res = await fetch(`/api/admin/matches/${match.id}/add-player`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ name, team, role: addRole }),
+      })
+      const data = await res.json()
+      if (data.success && data.player) {
+        // Append the new player to local state (avoids a round-trip).  Mark
+        // them pre-selected as XI so the admin sees them in the chosen group.
+        setSquadPlayers(prev => [...prev, data.player as Player])
+        setSelectedXI(prev => new Set([...prev, data.player.cricketdata_player_id]))
+        setAddName("")
+        setMessage(`Added ${data.player.name} to ${data.player.team}.`)
+      } else {
+        setMessage(`Error: ${data.error}`)
+      }
+    } catch {
+      setMessage("Network error")
+    } finally {
+      setAddingPlayer(false)
     }
   }
 
@@ -162,7 +208,7 @@ export default function LockMatchPanel({
           <h3 className="font-semibold text-white mb-1">Step 1 — Fetch Full Squad</h3>
           <p className="text-gray-500 text-sm mb-4">
             Fetch anytime — even days before the match. Friends can start picking teams immediately.
-            Re-fetch after toss to get any squad updates.
+            Re-fetches merge cricapi + EntitySport and never remove existing players.
           </p>
           <button
             onClick={fetchSquad}
@@ -172,6 +218,72 @@ export default function LockMatchPanel({
             {loading ? "Fetching..." : squadSaved ? "Re-fetch Squad" : "Fetch Squad from API"}
           </button>
           {message && <p className="mt-2 text-sm text-gray-300">{message}</p>}
+
+          {/* Safety valve: manual add for players that neither feed returned */}
+          {squadSaved && (
+            <div className="mt-4 pt-4 border-t border-gray-800">
+              {!showAddPlayer ? (
+                <button
+                  type="button"
+                  onClick={() => { setShowAddPlayer(true); setAddTeam(match.team1) }}
+                  className="text-sm text-gray-400 hover:text-yellow-400 transition"
+                >
+                  + Add missing player manually
+                </button>
+              ) : (
+                <div className="space-y-2">
+                  <p className="text-gray-400 text-xs">
+                    Use this only when a player is announced but not showing above
+                    (e.g. a late-named impact sub neither API returned).
+                  </p>
+                  <input
+                    type="text"
+                    placeholder="Player name"
+                    value={addName}
+                    onChange={e => setAddName(e.target.value)}
+                    className="w-full bg-gray-800 border border-gray-700 rounded-lg px-3 py-2 text-sm text-white placeholder-gray-500 focus:outline-none focus:border-yellow-400"
+                  />
+                  <div className="flex gap-2">
+                    <select
+                      value={addTeam}
+                      onChange={e => setAddTeam(e.target.value)}
+                      className="flex-1 bg-gray-800 border border-gray-700 rounded-lg px-3 py-2 text-sm text-white focus:outline-none focus:border-yellow-400"
+                    >
+                      <option value={match.team1}>{match.team1}</option>
+                      <option value={match.team2}>{match.team2}</option>
+                    </select>
+                    <select
+                      value={addRole}
+                      onChange={e => setAddRole(e.target.value as typeof addRole)}
+                      className="bg-gray-800 border border-gray-700 rounded-lg px-3 py-2 text-sm text-white focus:outline-none focus:border-yellow-400"
+                    >
+                      <option value="BAT">BAT</option>
+                      <option value="BOWL">BOWL</option>
+                      <option value="ALL">ALL</option>
+                      <option value="WK">WK</option>
+                    </select>
+                  </div>
+                  <div className="flex gap-2">
+                    <button
+                      type="button"
+                      onClick={addMissingPlayer}
+                      disabled={addingPlayer || !addName.trim()}
+                      className="bg-green-600 text-white font-semibold px-3 py-2 rounded-lg text-sm hover:bg-green-500 transition disabled:opacity-50"
+                    >
+                      {addingPlayer ? "Adding..." : "Add Player"}
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => { setShowAddPlayer(false); setAddName("") }}
+                      className="bg-gray-800 text-gray-400 px-3 py-2 rounded-lg text-sm hover:text-white transition"
+                    >
+                      Cancel
+                    </button>
+                  </div>
+                </div>
+              )}
+            </div>
+          )}
         </div>
       )}
 
