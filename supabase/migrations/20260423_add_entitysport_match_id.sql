@@ -1,28 +1,33 @@
--- Add EntitySport match_id cache column to matches.
+-- Schema safety migration — run once against prod Supabase (SQL editor → paste → run).
+-- Idempotent: all `if not exists` guards mean re-running is safe.
 --
--- WHY: every live poll and every squad fetch used to re-run the 5-URL
--- EntitySport listing aggregation to map our stored team names → EntitySport's
--- internal match_id.  Each of those URL calls counts against the RapidAPI
--- quota.  For a 4-hour match polling every 60s we were burning ~1,200 listing
--- calls just to keep discovering the same match_id over and over.
+-- Two independent fixes bundled here so there's exactly one thing to run:
 --
--- Fix: cache the resolved EntitySport match_id on the matches row the first
--- time we resolve it.  Subsequent polls skip the listing aggregation entirely
--- and go straight to /matches/{id}/info.  Expected quota savings: ~80%.
+-- 1) matches.entitysport_match_id — cache of the resolved EntitySport match_id.
+--    Every live poll and every squad fetch used to re-run the 5-URL EntitySport
+--    listing aggregation to map stored team names → EntitySport's internal
+--    match_id.  Each call counts against the RapidAPI quota.  For a 4-hour
+--    match polling every 60s that's ~1,200 listing calls per match just to
+--    keep rediscovering the same ID.  Cache it on first resolve and subsequent
+--    polls skip the listing aggregation entirely (~80% quota savings).
 --
--- The cricbuzz_match_id column was added in the original schema but was never
--- wired up — as of 2026-04-23 we're now filling it alongside
--- entitysport_match_id for the same reason.  No migration needed for that
--- column; it already exists.
+--    The cricbuzz_match_id column already existed in the original schema; as
+--    of 2026-04-23 we fill it alongside entitysport_match_id for the same
+--    reason.  No migration needed for cricbuzz_match_id.
 --
--- Run this once against the prod Supabase project (SQL editor → paste → run).
--- Idempotent: the `if not exists` guard means re-running is safe.
+-- 2) match_players.is_substitute — flag marking impact subs so the UI and
+--    lock flow can distinguish them from the announced XI.  Has been used in
+--    code (lock route, fetch-squad, add-player, live-scoring auto-insert)
+--    for weeks but was never added to schema.sql, so any Supabase project
+--    bootstrapped from the canonical schema would 500 on the write path.
+--    Add defensively here.
 
 alter table matches
   add column if not exists entitysport_match_id text;
 
--- Useful for debugging: show matches that have / haven't been resolved yet.
--- (This is an index for the admin, not a performance need — table is small.)
 create index if not exists idx_matches_entitysport_match_id
   on matches (entitysport_match_id)
   where entitysport_match_id is not null;
+
+alter table match_players
+  add column if not exists is_substitute boolean default false;

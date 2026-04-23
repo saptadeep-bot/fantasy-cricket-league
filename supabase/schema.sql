@@ -44,6 +44,7 @@ create table match_players (
   role text not null check (role in ('BAT', 'BOWL', 'ALL', 'WK')),
   fantasy_points decimal(6,1) default 0,
   is_playing boolean default true,
+  is_substitute boolean default false,
   last_updated timestamptz default now(),
   unique(match_id, cricketdata_player_id)
 );

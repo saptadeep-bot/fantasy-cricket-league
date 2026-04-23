@@ -75,26 +75,43 @@ export async function POST(req: NextRequest, { params }: { params: Promise<{ id:
   const manualId = `manual_${randomBytes(6).toString("hex")}`
   const now = new Date().toISOString()
 
+  const row: Record<string, unknown> = {
+    match_id: id,
+    cricketdata_player_id: manualId,
+    name,
+    team,
+    role,
+    // Manually-added players are assumed to be announced — if not, the
+    // admin can still toggle them off in the lock panel before locking.
+    is_playing: true,
+    is_substitute: true,
+    fantasy_points: 0,
+    last_updated: now,
+  }
+
   const { data: inserted, error } = await supabaseAdmin
     .from("match_players")
-    .insert({
-      match_id: id,
-      cricketdata_player_id: manualId,
-      name,
-      team,
-      role,
-      // Manually-added players are assumed to be announced — if not, the
-      // admin can still toggle them off in the lock panel before locking.
-      is_playing: true,
-      is_substitute: true,
-      fantasy_points: 0,
-      last_updated: now,
-    })
+    .insert(row)
     .select()
     .single()
 
   if (error) {
-    return NextResponse.json({ error: error.message }, { status: 500 })
+    const msg = error.message || ""
+    const looksLikeMissingColumn =
+      /is_substitute/i.test(msg) && /column|does not exist|schema cache/i.test(msg)
+    if (looksLikeMissingColumn) {
+      // Retry without is_substitute — graceful degradation if migration
+      // hasn't been run yet.  The admin can still add the player; they
+      // just won't be flagged as a sub in the UI until migration lands.
+      // eslint-disable-next-line @typescript-eslint/no-unused-vars
+      const { is_substitute, ...stripped } = row
+      const retry = await supabaseAdmin.from("match_players").insert(stripped).select().single()
+      if (retry.error) {
+        return NextResponse.json({ error: "retry: " + retry.error.message }, { status: 500 })
+      }
+      return NextResponse.json({ success: true, player: retry.data })
+    }
+    return NextResponse.json({ error: msg }, { status: 500 })
   }
 
   return NextResponse.json({ success: true, player: inserted })

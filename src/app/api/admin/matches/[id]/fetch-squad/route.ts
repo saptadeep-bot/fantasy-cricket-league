@@ -118,10 +118,50 @@ interface MergedPlayer {
   is_playing_hint: boolean     // from EntitySport's `playing11:"true"`
 }
 
+// Cross-source team-name matching.  Cricapi returns full names ("Royal
+// Challengers Bengaluru"); EntitySport often returns either full names OR
+// short-codes ("RCB").  The old equality/substring check failed the short-
+// code case entirely, which meant EntitySport-only players got bucketed
+// under their short-code team label instead of being merged with the
+// cricapi player under the full team name.
+//
+// Curated alias map covers every IPL team's known variants.  Falls back to
+// the generic acronym/substring match so non-IPL fixtures (warm-ups, rare
+// tournaments) still work.
+const TEAM_ALIASES: Record<string, string[]> = {
+  "royal challengers bengaluru": ["rcb", "royal challengers bangalore", "bengaluru", "bangalore"],
+  "royal challengers bangalore": ["rcb", "royal challengers bengaluru", "bengaluru", "bangalore"],
+  "chennai super kings": ["csk", "chennai"],
+  "mumbai indians": ["mi", "mumbai"],
+  "kolkata knight riders": ["kkr", "kolkata"],
+  "sunrisers hyderabad": ["srh", "hyderabad"],
+  "delhi capitals": ["dc", "delhi"],
+  "punjab kings": ["pbks", "punjab", "kings xi punjab", "kxip"],
+  "rajasthan royals": ["rr", "rajasthan"],
+  "lucknow super giants": ["lsg", "lucknow"],
+  "gujarat titans": ["gt", "gujarat"],
+}
+
+function acronymOf(name: string): string {
+  const parts = normaliseName(name).split(" ").filter(Boolean)
+  if (parts.length < 2) return ""
+  return parts.map(p => p[0]).join("")
+}
+
 function sameTeam(a: string, b: string): boolean {
   const na = normaliseName(a), nb = normaliseName(b)
   if (!na || !nb) return false
   if (na === nb) return true
+  // Curated alias lookup — handles "LSG" ↔ "Lucknow Super Giants" etc.
+  const aliasA = TEAM_ALIASES[na] ?? []
+  if (aliasA.includes(nb)) return true
+  const aliasB = TEAM_ALIASES[nb] ?? []
+  if (aliasB.includes(na)) return true
+  // Cross-match if they share any alias (e.g. both aliases of the same team)
+  if (aliasA.some(x => aliasB.includes(x))) return true
+  // Generic acronym match: "lsg" vs "lucknow super giants"
+  if (acronymOf(na) === nb || acronymOf(nb) === na) return true
+  // Fallback: substring containment (original behaviour)
   return na.includes(nb) || nb.includes(na)
 }
 
@@ -203,13 +243,23 @@ export async function POST(req: NextRequest, { params }: { params: Promise<{ id:
     return NextResponse.json({ error: "Unauthorized" }, { status: 401 })
   }
 
+  // Defensive read: SELECT * so that a missing `entitysport_match_id` column
+  // (migration not yet run) doesn't 400 the whole request.  Degrades cleanly:
+  // `cachedEsMatchId` is just undefined and the fetcher re-runs the listing
+  // aggregation.
   const { data: match } = await supabaseAdmin
     .from("matches")
-    .select("cricketdata_match_id, team1, team2, entitysport_match_id")
+    .select("*")
     .eq("id", id)
     .single()
 
   if (!match) return NextResponse.json({ error: "Match not found" }, { status: 404 })
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const matchRow = match as Record<string, any>
+  const cricketdataMatchId = (matchRow.cricketdata_match_id as string | undefined) ?? ""
+  const matchTeam1 = (matchRow.team1 as string | undefined) ?? ""
+  const matchTeam2 = (matchRow.team2 as string | undefined) ?? ""
+  const cachedEsMatchId = (matchRow.entitysport_match_id as string | null | undefined) ?? null
 
   try {
     // Parallel fetch — EntitySport failures (quota / outage) must NOT block
@@ -217,16 +267,23 @@ export async function POST(req: NextRequest, { params }: { params: Promise<{ id:
     // the cached EntitySport match_id so we skip the listing aggregation when
     // we've already resolved it on a prior fetch.
     const [cricapiResult, esResult] = await Promise.all([
-      fetchCricapiSquad(match.cricketdata_match_id),
-      fetchEntitySportSquadDetailed(match.team1 ?? "", match.team2 ?? "", match.entitysport_match_id ?? null),
+      fetchCricapiSquad(cricketdataMatchId),
+      fetchEntitySportSquadDetailed(matchTeam1, matchTeam2, cachedEsMatchId),
     ])
 
-    // Persist EntitySport match_id to cut quota on future fetches.
-    if (esResult.resolvedEsMatchId && esResult.resolvedEsMatchId !== match.entitysport_match_id) {
-      await supabaseAdmin
-        .from("matches")
-        .update({ entitysport_match_id: esResult.resolvedEsMatchId })
-        .eq("id", id)
+    // Persist EntitySport match_id to cut quota on future fetches.  Wrapped
+    // in try/catch: if the column doesn't exist yet, swallow the error so
+    // the squad fetch itself still succeeds.
+    if (esResult.resolvedEsMatchId && esResult.resolvedEsMatchId !== cachedEsMatchId) {
+      try {
+        await supabaseAdmin
+          .from("matches")
+          .update({ entitysport_match_id: esResult.resolvedEsMatchId })
+          .eq("id", id)
+      } catch {
+        // Ignore — migration may not have run yet.  Not fatal; we'll retry
+        // on the next fetch.
+      }
     }
 
     const cricapiPlayers = cricapiResult.players ?? []
@@ -242,9 +299,12 @@ export async function POST(req: NextRequest, { params }: { params: Promise<{ id:
 
     // Read existing players so we can preserve their is_playing/is_substitute/
     // fantasy_points flags and detect "in DB but not in either source" rows.
+    // SELECT * so a missing `is_substitute` column (migration not run yet)
+    // doesn't 400 this request — we fall back to treating all existing as
+    // non-subs, which is safe.
     const { data: existingRows } = await supabaseAdmin
       .from("match_players")
-      .select("id, cricketdata_player_id, name, team, role, is_playing, is_substitute, fantasy_points")
+      .select("*")
       .eq("match_id", id)
 
     const existingById = new Map<string, NonNullable<typeof existingRows>[number]>()
@@ -287,13 +347,29 @@ export async function POST(req: NextRequest, { params }: { params: Promise<{ id:
       }
     }
 
-    // Insert new rows
+    // Insert new rows.  If the `is_substitute` column doesn't exist yet
+    // (migration not run) the insert will fail with a PGRST/PGRST204 column-
+    // not-found error.  Retry once with `is_substitute` stripped so the
+    // squad fetch still succeeds in that scenario — we'd rather lose the
+    // sub-flag for now than break the whole match setup flow.
     if (toInsert.length > 0) {
       const { error: insertError } = await supabaseAdmin
         .from("match_players")
         .insert(toInsert)
       if (insertError) {
-        return NextResponse.json({ error: "insert: " + insertError.message }, { status: 500 })
+        const msg = insertError.message || ""
+        const looksLikeMissingColumn =
+          /is_substitute/i.test(msg) && /column|does not exist|schema cache/i.test(msg)
+        if (looksLikeMissingColumn) {
+          // eslint-disable-next-line @typescript-eslint/no-unused-vars
+          const stripped = toInsert.map(({ is_substitute, ...rest }) => rest)
+          const { error: retryErr } = await supabaseAdmin.from("match_players").insert(stripped)
+          if (retryErr) {
+            return NextResponse.json({ error: "insert (retry): " + retryErr.message }, { status: 500 })
+          }
+        } else {
+          return NextResponse.json({ error: "insert: " + msg }, { status: 500 })
+        }
       }
     }
 
@@ -310,9 +386,12 @@ export async function POST(req: NextRequest, { params }: { params: Promise<{ id:
     const preserved = (existingRows || []).filter(r => !mergedIds.has(r.cricketdata_player_id))
 
     // Re-read the full current squad so the client can refresh its state.
+    // SELECT * to stay resilient against schema drift (is_substitute column
+    // may not exist yet).  The client discards anything it doesn't know
+    // about, so extra fields are harmless.
     const { data: finalPlayers } = await supabaseAdmin
       .from("match_players")
-      .select("id, cricketdata_player_id, name, team, role, is_playing, is_substitute, fantasy_points")
+      .select("*")
       .eq("match_id", id)
       .order("team")
       .order("role")

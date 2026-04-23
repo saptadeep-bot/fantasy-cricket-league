@@ -191,30 +191,43 @@ export async function computeAndSave(matchId: string, scorecard: unknown[]): Pro
     }
   }
 
-  // Auto-insert truly unknown players (impact subs like Linde not in original squad)
+  // Auto-insert truly unknown players (impact subs like Linde not in original squad).
+  //
+  // Resilient to schema drift: if the `is_substitute` column hasn't been
+  // added to match_players yet (migration lag), retry the insert with that
+  // field stripped rather than losing the player's points entirely.  Missing
+  // the sub-flag is cosmetic; missing the points row means their fantasy
+  // points are lost permanently for this match.
   let autoAdded = 0
   const missed: string[] = []
   if (autoInsertPlayers.length > 0) {
-    const { error } = await supabaseAdmin
-      .from("match_players")
-      .insert(
-        autoInsertPlayers.map(p => ({
-          match_id: matchId,
-          cricketdata_player_id: p.cricketdata_player_id,
-          name: p.name,
-          team: p.team,
-          role: p.role,
-          is_playing: true,
-          is_substitute: true,
-          fantasy_points: p.fantasy_points,
-          last_updated: now,
-        }))
-      )
+    const rows = autoInsertPlayers.map(p => ({
+      match_id: matchId,
+      cricketdata_player_id: p.cricketdata_player_id,
+      name: p.name,
+      team: p.team,
+      role: p.role,
+      is_playing: true,
+      is_substitute: true,
+      fantasy_points: p.fantasy_points,
+      last_updated: now,
+    }))
+    const { error } = await supabaseAdmin.from("match_players").insert(rows)
     if (!error) {
       autoAdded = autoInsertPlayers.length
     } else {
-      // Insert failed — report as missed
-      missed.push(...autoInsertNames)
+      const msg = error.message || ""
+      const looksLikeMissingColumn =
+        /is_substitute/i.test(msg) && /column|does not exist|schema cache/i.test(msg)
+      if (looksLikeMissingColumn) {
+        // eslint-disable-next-line @typescript-eslint/no-unused-vars
+        const stripped = rows.map(({ is_substitute, ...rest }) => rest)
+        const { error: retryErr } = await supabaseAdmin.from("match_players").insert(stripped)
+        if (!retryErr) autoAdded = autoInsertPlayers.length
+        else missed.push(...autoInsertNames)
+      } else {
+        missed.push(...autoInsertNames)
+      }
     }
   }
 

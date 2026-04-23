@@ -229,15 +229,23 @@ async function tryEntitySportDirect(
 // ─── Main fetch path ──────────────────────────────────────────────────────────
 
 async function fetchAndSaveScores(matchId: string, cricketdataMatchId: string): Promise<FetchResult> {
+  // Defensive read: SELECT * instead of naming `entitysport_match_id` /
+  // `cricbuzz_match_id` explicitly.  If the migration hasn't been run yet,
+  // PostgREST returns a 400 on `.select("...entitysport_match_id...")` and
+  // the entire live-poll path breaks.  SELECT * degrades gracefully — the
+  // field is just `undefined` on older schemas and we fall back to the
+  // listing-aggregation path (slower but correct).
   const { data: matchRow } = await supabaseAdmin
     .from("matches")
-    .select("team1, team2, entitysport_match_id, cricbuzz_match_id")
+    .select("*")
     .eq("id", matchId)
     .single()
-  const team1 = matchRow?.team1 ?? ""
-  const team2 = matchRow?.team2 ?? ""
-  const cachedEsMatchId = matchRow?.entitysport_match_id ?? null
-  const cachedCbMatchId = matchRow?.cricbuzz_match_id ?? null
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const m = (matchRow ?? {}) as Record<string, any>
+  const team1 = (m.team1 as string | undefined) ?? ""
+  const team2 = (m.team2 as string | undefined) ?? ""
+  const cachedEsMatchId = (m.entitysport_match_id as string | null | undefined) ?? null
+  const cachedCbMatchId = (m.cricbuzz_match_id as string | null | undefined) ?? null
 
   // Step 1: richest scorecard from (cricapi + EntitySport) in parallel.  This
   // is the single unified path — see `scorecard-sources.ts` for why.  Pass
@@ -254,13 +262,20 @@ async function fetchAndSaveScores(matchId: string, cricketdataMatchId: string): 
   let lastDetail = `stored ID (${cricketdataMatchId}): ${first.detail}`
 
   // Persist resolved match IDs so subsequent polls skip the listing aggregation.
-  // We write whenever the resolved value differs from the cached one — including
-  // the cache-invalidation case (fetcher returned null despite fromCache=true).
+  // Wrapped in try/catch: if the column doesn't exist yet (migration not run),
+  // we swallow the error so the scores path stays up — we just pay the
+  // listing-aggregation cost on the next poll.  Better to waste quota than
+  // to 500 during a live match.
   const updates: Record<string, string | null> = {}
   if (first.resolvedEsMatchId !== cachedEsMatchId) updates.entitysport_match_id = first.resolvedEsMatchId
   if (first.resolvedCbMatchId !== cachedCbMatchId) updates.cricbuzz_match_id = first.resolvedCbMatchId
   if (Object.keys(updates).length > 0) {
-    await supabaseAdmin.from("matches").update(updates).eq("id", matchId)
+    try {
+      const { error: updErr } = await supabaseAdmin.from("matches").update(updates).eq("id", matchId)
+      if (updErr) lastDetail += ` | cache-persist skipped: ${updErr.message.slice(0, 80)}`
+    } catch (e) {
+      lastDetail += ` | cache-persist threw: ${String(e).slice(0, 80)}`
+    }
   }
 
   // Step 2: cricapi ID remap via currentMatches.  Only relevant when we got
