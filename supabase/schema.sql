@@ -17,6 +17,7 @@ create table matches (
   id uuid primary key default uuid_generate_v4(),
   cricketdata_match_id text unique not null,
   cricbuzz_match_id text,
+  entitysport_match_id text,
   name text not null,
   match_number int,
   match_type text not null check (match_type in ('league', 'qualifier1', 'qualifier2', 'eliminator', 'final')),

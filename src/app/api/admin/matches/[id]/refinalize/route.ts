@@ -47,11 +47,19 @@ export async function POST(req: NextRequest, { params }: { params: Promise<{ id:
     // EntitySport /info tried in parallel, richer one wins).  Same helper as
     // finalize/route.ts — they MUST stay in sync or we're right back to the
     // partial-data bug this endpoint was built to fix.
-    const { scorecard, source } = await fetchBestScorecard(
+    const { scorecard, source, resolvedEsMatchId } = await fetchBestScorecard(
       match.cricketdata_match_id,
       match.team1 ?? "",
       match.team2 ?? "",
+      { cachedEsMatchId: match.entitysport_match_id ?? null },
     )
+    // Persist resolved EntitySport match_id.
+    if (resolvedEsMatchId && resolvedEsMatchId !== match.entitysport_match_id) {
+      await supabaseAdmin
+        .from("matches")
+        .update({ entitysport_match_id: resolvedEsMatchId })
+        .eq("id", id)
+    }
     if (!scorecard || scorecard.length === 0) {
       return NextResponse.json({
         error: "Could not fetch a full scorecard from any source. Try again in a few minutes.",
@@ -61,6 +69,19 @@ export async function POST(req: NextRequest, { params }: { params: Promise<{ id:
       return NextResponse.json({
         error: `Scorecard only has ${scorecard.length} innings (source: ${source}). Both innings must be complete before re-finalizing.`,
       }, { status: 400 })
+    }
+    // Per-innings sanity check — same as finalize.  A match that re-finalizes
+    // on partial data causes the exact bug the refinalize endpoint exists to
+    // fix, so we'd rather fail loudly here.
+    for (let i = 0; i < 2; i++) {
+      const inn = scorecard[i] as { batting?: unknown[]; bowling?: unknown[]; inning?: string }
+      const batN = inn.batting?.length ?? 0
+      const bowlN = inn.bowling?.length ?? 0
+      if (batN < 5 || bowlN < 3) {
+        return NextResponse.json({
+          error: `Innings ${i + 1} (${inn.inning ?? "?"}) looks incomplete: ${batN} batters, ${bowlN} bowlers (source: ${source}). Re-finalize needs ≥5 batters and ≥3 bowlers per innings.`,
+        }, { status: 400 })
+      }
     }
 
     // Step 2: Recompute match_players.fantasy_points from scratch

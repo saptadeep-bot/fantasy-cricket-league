@@ -216,12 +216,23 @@ function convertEntitySportScorecard(innings: any[]): unknown[] {
 // match_id by aggregating multiple listing endpoints and tokenising team names.
 // Used by BOTH the scorecard fetcher AND the squad fetcher — don't inline a
 // second copy here (it drifted once already, commit fdaf8fe).
+//
+// Caching: if `cachedId` is provided, skip the listing aggregation entirely
+// and return it.  We don't round-trip a validation call because the caller
+// will immediately fetch `/info` next anyway — if the cached ID is wrong, that
+// request will fail and the caller can invalidate the cache and retry with
+// `cachedId: null`.  The caller's `/info` failure path already handles this
+// transparently via `reason: matched_<id>_info_http_<code>`.
 export async function resolveEntitySportMatchId(
   team1: string,
   team2: string,
-): Promise<{ esMatchId: string | null; reason: string }> {
-  if (!CRICBUZZ_API_KEY) return { esMatchId: null, reason: "no_api_key" }
-  if (!team1 || !team2) return { esMatchId: null, reason: "no_teams" }
+  cachedId?: string | null,
+): Promise<{ esMatchId: string | null; reason: string; fromCache: boolean }> {
+  if (cachedId) {
+    return { esMatchId: String(cachedId), reason: `cached_${cachedId}`, fromCache: true }
+  }
+  if (!CRICBUZZ_API_KEY) return { esMatchId: null, reason: "no_api_key", fromCache: false }
+  if (!team1 || !team2) return { esMatchId: null, reason: "no_teams", fromCache: false }
 
   const headers = {
     "x-rapidapi-key": CRICBUZZ_API_KEY,
@@ -274,7 +285,7 @@ export async function resolveEntitySportMatchId(
     } catch { statuses.push("json-err") }
   }
   if (allMatches.length === 0) {
-    return { esMatchId: null, reason: `no_listings [${statuses.join(",")}]` }
+    return { esMatchId: null, reason: `no_listings [${statuses.join(",")}]`, fromCache: false }
   }
 
   const tokens = (name: string): string[] => {
@@ -306,20 +317,24 @@ export async function resolveEntitySportMatchId(
     return {
       esMatchId: null,
       reason: `listed_${allMatches.length}_no_team_match (t1=${t1.join(",")};t2=${t2.join(",")};sample=${sample})`,
+      fromCache: false,
     }
   }
 
   const esMatchId = found.match_id ?? found.id
-  if (!esMatchId) return { esMatchId: null, reason: "matched_but_no_id" }
-  return { esMatchId: String(esMatchId), reason: `ok_found_${esMatchId}` }
+  if (!esMatchId) return { esMatchId: null, reason: "matched_but_no_id", fromCache: false }
+  return { esMatchId: String(esMatchId), reason: `ok_found_${esMatchId}`, fromCache: false }
 }
 
 export async function fetchEntitySportScorecardDetailed(
   team1: string,
-  team2: string
-): Promise<{ scorecard: unknown[] | null; reason: string }> {
-  const resolved = await resolveEntitySportMatchId(team1, team2)
-  if (!resolved.esMatchId) return { scorecard: null, reason: resolved.reason }
+  team2: string,
+  cachedId?: string | null,
+): Promise<{ scorecard: unknown[] | null; reason: string; resolvedEsMatchId: string | null }> {
+  const resolved = await resolveEntitySportMatchId(team1, team2, cachedId)
+  if (!resolved.esMatchId) {
+    return { scorecard: null, reason: resolved.reason, resolvedEsMatchId: null }
+  }
   const esMatchId = resolved.esMatchId
 
   try {
@@ -334,14 +349,21 @@ export async function fetchEntitySportScorecardDetailed(
     )
     if (!infoRes || !infoRes.ok) {
       const code = infoRes ? infoRes.status : "timeout"
-      return { scorecard: null, reason: `matched_${esMatchId}_info_http_${code}` }
+      // If the cached ID's /info call 404'd, invalidate the cache by returning
+      // resolvedEsMatchId:null despite having attempted — caller will overwrite.
+      const invalidate = resolved.fromCache && infoRes && infoRes.status === 404
+      return {
+        scorecard: null,
+        reason: `matched_${esMatchId}_info_http_${code}${resolved.fromCache ? "_fromcache" : ""}`,
+        resolvedEsMatchId: invalidate ? null : esMatchId,
+      }
     }
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     const infoData: any = await infoRes.json()
 
     const innings = infoData?.response?.scorecard?.innings
     if (!Array.isArray(innings) || innings.length === 0) {
-      return { scorecard: null, reason: `matched_${esMatchId}_no_innings` }
+      return { scorecard: null, reason: `matched_${esMatchId}_no_innings`, resolvedEsMatchId: esMatchId }
     }
 
     const converted = convertEntitySportScorecard(innings)
@@ -350,11 +372,11 @@ export async function fetchEntitySportScorecardDetailed(
       return sum + (i.batting?.length ?? 0) + (i.bowling?.length ?? 0)
     }, 0)
     if (playerCount === 0) {
-      return { scorecard: null, reason: `matched_${esMatchId}_empty_players` }
+      return { scorecard: null, reason: `matched_${esMatchId}_empty_players`, resolvedEsMatchId: esMatchId }
     }
-    return { scorecard: converted, reason: `ok_${playerCount}` }
+    return { scorecard: converted, reason: `ok_${playerCount}`, resolvedEsMatchId: esMatchId }
   } catch (e) {
-    return { scorecard: null, reason: `error:${String(e).slice(0, 60)}` }
+    return { scorecard: null, reason: `error:${String(e).slice(0, 60)}`, resolvedEsMatchId: esMatchId }
   }
 }
 
@@ -395,9 +417,12 @@ function mapEntitySportRole(role: string): "BAT" | "BOWL" | "ALL" | "WK" {
 export async function fetchEntitySportSquadDetailed(
   team1: string,
   team2: string,
-): Promise<{ players: EntitySportSquadPlayer[] | null; reason: string }> {
-  const resolved = await resolveEntitySportMatchId(team1, team2)
-  if (!resolved.esMatchId) return { players: null, reason: resolved.reason }
+  cachedId?: string | null,
+): Promise<{ players: EntitySportSquadPlayer[] | null; reason: string; resolvedEsMatchId: string | null }> {
+  const resolved = await resolveEntitySportMatchId(team1, team2, cachedId)
+  if (!resolved.esMatchId) {
+    return { players: null, reason: resolved.reason, resolvedEsMatchId: null }
+  }
   const esMatchId = resolved.esMatchId
 
   try {
@@ -412,7 +437,12 @@ export async function fetchEntitySportSquadDetailed(
     )
     if (!infoRes || !infoRes.ok) {
       const code = infoRes ? infoRes.status : "timeout"
-      return { players: null, reason: `matched_${esMatchId}_info_http_${code}` }
+      const invalidate = resolved.fromCache && infoRes && infoRes.status === 404
+      return {
+        players: null,
+        reason: `matched_${esMatchId}_info_http_${code}${resolved.fromCache ? "_fromcache" : ""}`,
+        resolvedEsMatchId: invalidate ? null : esMatchId,
+      }
     }
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     const infoData: any = await infoRes.json()
@@ -458,18 +488,22 @@ export async function fetchEntitySportSquadDetailed(
     pushSquad(teamb, teamBName)
 
     if (out.length === 0) {
-      return { players: null, reason: `matched_${esMatchId}_empty_squads` }
+      return { players: null, reason: `matched_${esMatchId}_empty_squads`, resolvedEsMatchId: esMatchId }
     }
-    return { players: out, reason: `ok_${out.length}` }
+    return { players: out, reason: `ok_${out.length}`, resolvedEsMatchId: esMatchId }
   } catch (e) {
-    return { players: null, reason: `error:${String(e).slice(0, 60)}` }
+    return { players: null, reason: `error:${String(e).slice(0, 60)}`, resolvedEsMatchId: esMatchId }
   }
 }
 
 // Back-compat wrapper — used by finalize/refinalize which don't need the
 // reason string.  New callers should prefer `fetchEntitySportScorecardDetailed`.
-export async function fetchEntitySportScorecard(team1: string, team2: string): Promise<unknown[] | null> {
-  const r = await fetchEntitySportScorecardDetailed(team1, team2)
+export async function fetchEntitySportScorecard(
+  team1: string,
+  team2: string,
+  cachedId?: string | null,
+): Promise<unknown[] | null> {
+  const r = await fetchEntitySportScorecardDetailed(team1, team2, cachedId)
   return r.scorecard
 }
 
@@ -589,12 +623,83 @@ function flattenCricbuzzMatches(data: any): any[] {
   return all
 }
 
+// Shared Cricbuzz match_id resolver — symmetric with resolveEntitySportMatchId.
+// Aggregates across /matches/v1/live and /matches/v1/recent, tokenises team
+// names, returns the first matching Cricbuzz matchId.
+export async function resolveCricbuzzMatchId(
+  team1: string,
+  team2: string,
+  cachedId?: string | null,
+): Promise<{ cbMatchId: string | null; reason: string; fromCache: boolean }> {
+  if (cachedId) {
+    return { cbMatchId: String(cachedId), reason: `cached_${cachedId}`, fromCache: true }
+  }
+  if (!CRICBUZZ_API_KEY) return { cbMatchId: null, reason: "no_api_key", fromCache: false }
+  if (!team1 || !team2) return { cbMatchId: null, reason: "no_teams", fromCache: false }
+
+  const headers = {
+    "X-RapidAPI-Key": CRICBUZZ_API_KEY,
+    "X-RapidAPI-Host": "cricbuzz-cricket.p.rapidapi.com",
+  }
+  const tokens = (name: string): string[] => {
+    const parts = name.toLowerCase().split(/\s+/).filter(Boolean)
+    const toks = new Set<string>([name.toLowerCase(), ...parts])
+    if (parts.length >= 2) toks.add(parts.map(p => p[0]).join(""))
+    return Array.from(toks).filter(t => t.length >= 2)
+  }
+  const t1 = tokens(team1)
+  const t2 = tokens(team2)
+  const hits = (haystack: string, toks: string[]) =>
+    toks.some(t => haystack.toLowerCase().includes(t))
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const findInList = (allMatches: any[]) =>
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    allMatches.find((m: any) => {
+      const mi = m.matchInfo
+      if (!mi) return false
+      const haystack = [
+        mi.team1?.teamName ?? "", mi.team1?.teamSName ?? "",
+        mi.team2?.teamName ?? "", mi.team2?.teamSName ?? "",
+      ].join(" ")
+      return hits(haystack, t1) && hits(haystack, t2)
+    })
+
+  const statuses: string[] = []
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  let found: any = null
+  for (const endpoint of ["live", "recent"]) {
+    const r = await timedFetch(`https://cricbuzz-cricket.p.rapidapi.com/matches/v1/${endpoint}`, {
+      headers, cache: "no-store",
+    })
+    if (!r) { statuses.push(`${endpoint}:TO`); continue }
+    if (!r.ok) { statuses.push(`${endpoint}:${r.status}`); continue }
+    try {
+      const data = await r.json()
+      found = findInList(flattenCricbuzzMatches(data))
+      statuses.push(`${endpoint}:200`)
+      if (found) break
+    } catch {
+      statuses.push(`${endpoint}:json-err`)
+    }
+  }
+  if (!found) return { cbMatchId: null, reason: `no_match [${statuses.join(",")}]`, fromCache: false }
+  const cbMatchId = found.matchInfo?.matchId
+  if (!cbMatchId) return { cbMatchId: null, reason: "matched_but_no_id", fromCache: false }
+  return { cbMatchId: String(cbMatchId), reason: `ok_found_${cbMatchId}`, fromCache: false }
+}
+
 export async function fetchCricbuzzScorecardDetailed(
   team1: string,
-  team2: string
-): Promise<{ scorecard: unknown[] | null; reason: string }> {
-  if (!CRICBUZZ_API_KEY) return { scorecard: null, reason: "no_api_key" }
-  if (!team1 || !team2) return { scorecard: null, reason: "no_teams" }
+  team2: string,
+  cachedId?: string | null,
+): Promise<{ scorecard: unknown[] | null; reason: string; resolvedCbMatchId: string | null }> {
+  if (!CRICBUZZ_API_KEY) return { scorecard: null, reason: "no_api_key", resolvedCbMatchId: null }
+
+  const resolved = await resolveCricbuzzMatchId(team1, team2, cachedId)
+  if (!resolved.cbMatchId) {
+    return { scorecard: null, reason: resolved.reason, resolvedCbMatchId: null }
+  }
+  const cbMatchId = resolved.cbMatchId
 
   try {
     const headers = {
@@ -602,63 +707,26 @@ export async function fetchCricbuzzScorecardDetailed(
       "X-RapidAPI-Host": "cricbuzz-cricket.p.rapidapi.com",
     }
 
-    const tokens = (name: string): string[] => {
-      const parts = name.toLowerCase().split(/\s+/).filter(Boolean)
-      const toks = new Set<string>([name.toLowerCase(), ...parts])
-      if (parts.length >= 2) toks.add(parts.map(p => p[0]).join(""))
-      return Array.from(toks).filter(t => t.length >= 2)
-    }
-    const t1 = tokens(team1)
-    const t2 = tokens(team2)
-    const hits = (haystack: string, toks: string[]) =>
-      toks.some(t => haystack.toLowerCase().includes(t))
-
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    const findInList = (allMatches: any[]) =>
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      allMatches.find((m: any) => {
-        const mi = m.matchInfo
-        if (!mi) return false
-        const haystack = [
-          mi.team1?.teamName ?? "", mi.team1?.teamSName ?? "",
-          mi.team2?.teamName ?? "", mi.team2?.teamSName ?? "",
-        ].join(" ")
-        return hits(haystack, t1) && hits(haystack, t2)
-      })
-
-    const statuses: string[] = []
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    let found: any = null
-    for (const endpoint of ["live", "recent"]) {
-      const r = await timedFetch(`https://cricbuzz-cricket.p.rapidapi.com/matches/v1/${endpoint}`, {
-        headers, cache: "no-store",
-      })
-      if (!r) { statuses.push(`${endpoint}:TO`); continue }
-      if (!r.ok) { statuses.push(`${endpoint}:${r.status}`); continue }
-      try {
-        const data = await r.json()
-        found = findInList(flattenCricbuzzMatches(data))
-        statuses.push(`${endpoint}:200`)
-        if (found) break
-      } catch {
-        statuses.push(`${endpoint}:json-err`)
-      }
-    }
-
-    if (!found) return { scorecard: null, reason: `no_match [${statuses.join(",")}]` }
-
-    const cbMatchId: number = found.matchInfo.matchId
     const scRes = await timedFetch(`https://cricbuzz-cricket.p.rapidapi.com/mcenter/v1/${cbMatchId}/scard`, {
       headers, cache: "no-store",
     })
-    if (!scRes) return { scorecard: null, reason: `matched_${cbMatchId}_scard_TO` }
-    if (!scRes.ok) return { scorecard: null, reason: `matched_${cbMatchId}_scard_${scRes.status}` }
+    if (!scRes) {
+      return { scorecard: null, reason: `matched_${cbMatchId}_scard_TO`, resolvedCbMatchId: cbMatchId }
+    }
+    if (!scRes.ok) {
+      const invalidate = resolved.fromCache && scRes.status === 404
+      return {
+        scorecard: null,
+        reason: `matched_${cbMatchId}_scard_${scRes.status}${resolved.fromCache ? "_fromcache" : ""}`,
+        resolvedCbMatchId: invalidate ? null : cbMatchId,
+      }
+    }
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     const scData: any = await scRes.json()
 
     const scArray = scData.scoreCard ?? scData.scorecard
     if (!Array.isArray(scArray) || scArray.length === 0) {
-      return { scorecard: null, reason: `matched_${cbMatchId}_empty_scard` }
+      return { scorecard: null, reason: `matched_${cbMatchId}_empty_scard`, resolvedCbMatchId: cbMatchId }
     }
 
     const converted = convertCricbuzzScorecard(scArray)
@@ -666,10 +734,12 @@ export async function fetchCricbuzzScorecardDetailed(
       const i = inn as { batting?: unknown[]; bowling?: unknown[] }
       return sum + (i.batting?.length ?? 0) + (i.bowling?.length ?? 0)
     }, 0)
-    if (playerCount === 0) return { scorecard: null, reason: `matched_${cbMatchId}_empty_players` }
-    return { scorecard: converted, reason: `ok_${playerCount}` }
+    if (playerCount === 0) {
+      return { scorecard: null, reason: `matched_${cbMatchId}_empty_players`, resolvedCbMatchId: cbMatchId }
+    }
+    return { scorecard: converted, reason: `ok_${playerCount}`, resolvedCbMatchId: cbMatchId }
   } catch (e) {
-    return { scorecard: null, reason: `error:${String(e).slice(0, 60)}` }
+    return { scorecard: null, reason: `error:${String(e).slice(0, 60)}`, resolvedCbMatchId: cbMatchId }
   }
 }
 
@@ -703,28 +773,39 @@ export function countScorecardPlayers(scorecard: any[]): number {
  * call this directly.  Live-poll uses `fetchBestScorecardLive` which layers
  * match-state detection on top of this.
  */
+export interface ScorecardCacheHint {
+  cachedEsMatchId?: string | null
+  cachedCbMatchId?: string | null
+}
+
 export async function fetchBestScorecard(
   cricketdataMatchId: string,
   team1: string,
-  team2: string
-): Promise<{ scorecard: unknown[] | null; source: string }> {
-  const [cricapiRes, esRes] = await Promise.all([
+  team2: string,
+  hint?: ScorecardCacheHint,
+): Promise<{ scorecard: unknown[] | null; source: string; resolvedEsMatchId: string | null }> {
+  const [cricapiRes, esDetailed] = await Promise.all([
     fetchCricapiScorecard(cricketdataMatchId),
-    fetchEntitySportScorecard(team1, team2),
+    fetchEntitySportScorecardDetailed(team1, team2, hint?.cachedEsMatchId ?? null),
   ])
+  const esRes = esDetailed.scorecard
 
   const cricapiN = cricapiRes ? countScorecardPlayers(cricapiRes as unknown[]) : 0
   const esN = esRes ? countScorecardPlayers(esRes as unknown[]) : 0
 
-  if (!cricapiRes && !esRes) return { scorecard: null, source: "none" }
-  if (!cricapiRes) return { scorecard: esRes, source: "entitysport-info" }
-  if (!esRes) return { scorecard: cricapiRes, source: "cricapi" }
+  const resolvedEsMatchId = esDetailed.resolvedEsMatchId
+
+  if (!cricapiRes && !esRes) return { scorecard: null, source: "none", resolvedEsMatchId }
+  if (!cricapiRes) return { scorecard: esRes, source: "entitysport-info", resolvedEsMatchId }
+  if (!esRes) return { scorecard: cricapiRes, source: "cricapi", resolvedEsMatchId }
 
   // Both present — pick the richer one.  When they're within 2 players of
   // each other, prefer cricapi (native shape, more fields preserved for
   // fielding).
-  if (cricapiN + 2 >= esN) return { scorecard: cricapiRes, source: `cricapi (${cricapiN} vs es ${esN})` }
-  return { scorecard: esRes, source: `entitysport-info (${esN} vs cricapi ${cricapiN})` }
+  if (cricapiN + 2 >= esN) {
+    return { scorecard: cricapiRes, source: `cricapi (${cricapiN} vs es ${esN})`, resolvedEsMatchId }
+  }
+  return { scorecard: esRes, source: `entitysport-info (${esN} vs cricapi ${cricapiN})`, resolvedEsMatchId }
 }
 
 // ─── Live-aware variant ──────────────────────────────────────────────────────
@@ -740,6 +821,14 @@ export interface LiveScorecardResult {
   /** Single-string summary of what happened across all sources.  Safe to log
    * or display — includes counts and state flags for diagnostics. */
   detail: string
+  /** EntitySport match_id we successfully resolved this call, or null if we
+   * couldn't resolve one.  Caller should write this back to
+   * `matches.entitysport_match_id` when non-null and different from cache —
+   * future polls can then skip the 5-URL listing aggregation entirely. */
+  resolvedEsMatchId: string | null
+  /** Cricbuzz match_id we successfully resolved this call, or null.  Same
+   * caching semantics as resolvedEsMatchId. */
+  resolvedCbMatchId: string | null
 }
 
 /**
@@ -755,7 +844,8 @@ export interface LiveScorecardResult {
 export async function fetchBestScorecardLive(
   cricketdataMatchId: string,
   team1: string,
-  team2: string
+  team2: string,
+  hint?: ScorecardCacheHint,
 ): Promise<LiveScorecardResult> {
   // Three sources in parallel.  Cricbuzz was removed in the 2026-04-22
   // refactor but restored the same day when EntitySport went dark mid-match
@@ -763,8 +853,8 @@ export async function fetchBestScorecardLive(
   const [cricapiSc, cricapiInfo, esDetailed, cbDetailed] = await Promise.all([
     fetchCricapiScorecard(cricketdataMatchId),
     fetchCricapiMatchInfo(cricketdataMatchId),
-    fetchEntitySportScorecardDetailed(team1, team2),
-    fetchCricbuzzScorecardDetailed(team1, team2),
+    fetchEntitySportScorecardDetailed(team1, team2, hint?.cachedEsMatchId ?? null),
+    fetchCricbuzzScorecardDetailed(team1, team2, hint?.cachedCbMatchId ?? null),
   ])
 
   const esSc = esDetailed.scorecard
@@ -805,5 +895,13 @@ export async function fetchBestScorecardLive(
   // to diagnose "all zero" failures without fishing through Vercel logs.
   const detail = `cricapi:${cricapiN} | es:${esN} (${esDetailed.reason}) | cb:${cbN} (${cbDetailed.reason}) | ${infoStr} | source:${source}`
 
-  return { scorecard, source, liveInProgress, notStarted, detail }
+  return {
+    scorecard,
+    source,
+    liveInProgress,
+    notStarted,
+    detail,
+    resolvedEsMatchId: esDetailed.resolvedEsMatchId,
+    resolvedCbMatchId: cbDetailed.resolvedCbMatchId,
+  }
 }

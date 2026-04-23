@@ -231,20 +231,37 @@ async function tryEntitySportDirect(
 async function fetchAndSaveScores(matchId: string, cricketdataMatchId: string): Promise<FetchResult> {
   const { data: matchRow } = await supabaseAdmin
     .from("matches")
-    .select("team1, team2")
+    .select("team1, team2, entitysport_match_id, cricbuzz_match_id")
     .eq("id", matchId)
     .single()
   const team1 = matchRow?.team1 ?? ""
   const team2 = matchRow?.team2 ?? ""
+  const cachedEsMatchId = matchRow?.entitysport_match_id ?? null
+  const cachedCbMatchId = matchRow?.cricbuzz_match_id ?? null
 
   // Step 1: richest scorecard from (cricapi + EntitySport) in parallel.  This
-  // is the single unified path — see `scorecard-sources.ts` for why.
-  const first = await fetchBestScorecardLive(cricketdataMatchId, team1, team2)
+  // is the single unified path — see `scorecard-sources.ts` for why.  Pass
+  // cached match IDs so the listing-aggregation step is skipped when we've
+  // already resolved them on a prior poll (cuts ~10 RapidAPI calls/poll).
+  const first = await fetchBestScorecardLive(cricketdataMatchId, team1, team2, {
+    cachedEsMatchId,
+    cachedCbMatchId,
+  })
   let scorecard = first.scorecard
   let source = first.source
   let liveInProgress = first.liveInProgress
   let notStarted = first.notStarted
   let lastDetail = `stored ID (${cricketdataMatchId}): ${first.detail}`
+
+  // Persist resolved match IDs so subsequent polls skip the listing aggregation.
+  // We write whenever the resolved value differs from the cached one — including
+  // the cache-invalidation case (fetcher returned null despite fromCache=true).
+  const updates: Record<string, string | null> = {}
+  if (first.resolvedEsMatchId !== cachedEsMatchId) updates.entitysport_match_id = first.resolvedEsMatchId
+  if (first.resolvedCbMatchId !== cachedCbMatchId) updates.cricbuzz_match_id = first.resolvedCbMatchId
+  if (Object.keys(updates).length > 0) {
+    await supabaseAdmin.from("matches").update(updates).eq("id", matchId)
+  }
 
   // Step 2: cricapi ID remap via currentMatches.  Only relevant when we got
   // NOTHING from either source — that's typically a stale stored

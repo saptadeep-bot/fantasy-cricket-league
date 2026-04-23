@@ -40,11 +40,20 @@ export async function POST(req: NextRequest, { params }: { params: Promise<{ id:
     // cricapi + EntitySport in parallel and returns whichever has more players
     // listed — defends against partial cricapi data during the window where
     // `fantasyEnabled` has flipped but the scorecard is still populating.
-    const { scorecard, source } = await fetchBestScorecard(
+    const { scorecard, source, resolvedEsMatchId } = await fetchBestScorecard(
       match.cricketdata_match_id,
       match.team1 ?? "",
       match.team2 ?? "",
+      { cachedEsMatchId: match.entitysport_match_id ?? null },
     )
+
+    // Persist resolved EntitySport match_id for future live/finalize calls.
+    if (resolvedEsMatchId && resolvedEsMatchId !== match.entitysport_match_id) {
+      await supabaseAdmin
+        .from("matches")
+        .update({ entitysport_match_id: resolvedEsMatchId })
+        .eq("id", id)
+    }
 
     if (!scorecard || scorecard.length === 0) {
       return NextResponse.json({
@@ -56,14 +65,30 @@ export async function POST(req: NextRequest, { params }: { params: Promise<{ id:
         error: `Only ${scorecard.length} innings in scorecard (source: ${source}). Both innings must be complete before finalizing.`
       }, { status: 400 })
     }
-    // Sanity check — a full T20 scorecard has 10+ batters + 6+ bowlers per
-    // side.  If we see fewer than ~15 players across both innings something
-    // went wrong and we should refuse to finalize on bad data.
+    // Sanity checks — catch partial-data bugs like the 2026-04-18 incident
+    // where cricapi's fantasyEnabled flipped early but its scorecard was
+    // still populating player-by-player.  We now enforce BOTH:
+    //   (1) total ≥ 15 — blocks thin scorecards (original guard)
+    //   (2) each of the first 2 innings has ≥ 5 batters AND ≥ 3 bowlers —
+    //       blocks asymmetric partials (innings 1 complete, innings 2 empty)
+    //       that the total-only guard would let through.
+    // Super overs / 3rd innings are not checked — they're optional and often
+    // tiny even in well-formed scorecards.
     const playerCount = countScorecardPlayers(scorecard as unknown[])
     if (playerCount < 15) {
       return NextResponse.json({
         error: `Scorecard looks incomplete — only ${playerCount} batter/bowler entries across both innings (source: ${source}). A full T20 scorecard should have 20+. Wait a minute and try again.`
       }, { status: 400 })
+    }
+    for (let i = 0; i < 2; i++) {
+      const inn = scorecard[i] as { batting?: unknown[]; bowling?: unknown[]; inning?: string }
+      const batN = inn.batting?.length ?? 0
+      const bowlN = inn.bowling?.length ?? 0
+      if (batN < 5 || bowlN < 3) {
+        return NextResponse.json({
+          error: `Innings ${i + 1} (${inn.inning ?? "?"}) looks incomplete: ${batN} batters, ${bowlN} bowlers (source: ${source}). Need ≥5 batters and ≥3 bowlers per innings to finalize safely.`
+        }, { status: 400 })
+      }
     }
 
     // Step 2: Compute and save all player fantasy points (uses name-matching + auto-insert for impact subs)

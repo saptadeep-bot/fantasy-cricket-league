@@ -205,7 +205,7 @@ export async function POST(req: NextRequest, { params }: { params: Promise<{ id:
 
   const { data: match } = await supabaseAdmin
     .from("matches")
-    .select("cricketdata_match_id, team1, team2")
+    .select("cricketdata_match_id, team1, team2, entitysport_match_id")
     .eq("id", id)
     .single()
 
@@ -213,11 +213,21 @@ export async function POST(req: NextRequest, { params }: { params: Promise<{ id:
 
   try {
     // Parallel fetch — EntitySport failures (quota / outage) must NOT block
-    // cricapi.  Each returns `{ players: null, reason }` on failure.
+    // cricapi.  Each returns `{ players: null, reason }` on failure.  Pass
+    // the cached EntitySport match_id so we skip the listing aggregation when
+    // we've already resolved it on a prior fetch.
     const [cricapiResult, esResult] = await Promise.all([
       fetchCricapiSquad(match.cricketdata_match_id),
-      fetchEntitySportSquadDetailed(match.team1 ?? "", match.team2 ?? ""),
+      fetchEntitySportSquadDetailed(match.team1 ?? "", match.team2 ?? "", match.entitysport_match_id ?? null),
     ])
+
+    // Persist EntitySport match_id to cut quota on future fetches.
+    if (esResult.resolvedEsMatchId && esResult.resolvedEsMatchId !== match.entitysport_match_id) {
+      await supabaseAdmin
+        .from("matches")
+        .update({ entitysport_match_id: esResult.resolvedEsMatchId })
+        .eq("id", id)
+    }
 
     const cricapiPlayers = cricapiResult.players ?? []
     const esPlayers = esResult.players ?? []
