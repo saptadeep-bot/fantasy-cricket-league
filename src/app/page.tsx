@@ -15,43 +15,60 @@ function getEntryFee(matchType: string): number {
 export default async function HomePage() {
   const session = await auth()
   if (!session) redirect("/login")
+  // Capture user id outside the closure below — TS doesn't narrow `session`
+  // through nested function scopes.
+  const userId = session.user.id
 
-  // Fetch next 4 upcoming/active matches
-  const { data: upcomingMatches } = await supabaseAdmin
+  // Fetch next 6 upcoming/locked/live matches.  We bumped the limit from 4
+  // to 6 so two simultaneous live matches don't crowd out the next two
+  // pickable upcoming ones in the same fetch.
+  const { data: activeMatches } = await supabaseAdmin
     .from("matches")
     .select("*")
     .in("status", ["upcoming", "locked", "live"])
     .order("scheduled_at", { ascending: true })
-    .limit(4)
+    .limit(6)
 
-  const nextMatch = upcomingMatches?.[0] ?? null
-
-  const secondMatch = upcomingMatches?.[1] ?? null
+  // Split by status.  Multiple live matches can run simultaneously on
+  // double-header days — surface ALL of them in their own section instead
+  // of only featuring the first one as a single hero card (the old layout
+  // hid the second live match entirely until the first finished).
+  const liveMatches = (activeMatches || []).filter(m => m.status === "live")
+  const pickableMatches = (activeMatches || []).filter(m => m.status === "upcoming" || m.status === "locked")
+  // Hero spot — the next match the user can actually act on (pick / edit
+  // their team).  Falls back to first activeMatch if there are no
+  // pickables (everything is live).
+  const heroMatch = pickableMatches[0] ?? activeMatches?.[0] ?? null
+  const remainingPickables = pickableMatches.slice(1)
 
   // Fetch all users in the league
   const { data: allUsers } = await supabaseAdmin
     .from("users")
     .select("id, name")
 
-  // Fetch all submitted teams for upcoming matches in one query
-  const upcomingIds = (upcomingMatches || []).map(m => m.id)
-  const { data: allUpcomingTeams } = upcomingIds.length > 0
+  // Fetch all submitted teams for active matches in one query
+  const activeIds = (activeMatches || []).map(m => m.id)
+  const { data: allActiveTeams } = activeIds.length > 0
     ? await supabaseAdmin
         .from("teams")
         .select("match_id, user_id")
-        .in("match_id", upcomingIds)
+        .in("match_id", activeIds)
     : { data: [] }
 
   // Helper: get first names of who has/hasn't submitted for a match
   function getSubmissionStatus(matchId: string) {
-    const submittedUserIds = new Set((allUpcomingTeams || []).filter(t => t.match_id === matchId).map(t => t.user_id))
+    const submittedUserIds = new Set((allActiveTeams || []).filter(t => t.match_id === matchId).map(t => t.user_id))
     const done = (allUsers || []).filter(u => submittedUserIds.has(u.id)).map(u => u.name.split(" ")[0])
     const pending = (allUsers || []).filter(u => !submittedUserIds.has(u.id)).map(u => u.name.split(" ")[0])
     return { done, pending }
   }
 
-  const myNextTeam = nextMatch ? (allUpcomingTeams || []).find(t => t.match_id === nextMatch.id && t.user_id === session.user.id) : null
-  const mySecondTeam = secondMatch ? (allUpcomingTeams || []).find(t => t.match_id === secondMatch.id && t.user_id === session.user.id) : null
+  // Per-card team lookup — replaces the old "myNextTeam / mySecondTeam"
+  // pattern that hardcoded the first two activeMatches.  Now any card can
+  // ask whether the current user has a team for that specific match.
+  function userHasTeam(matchId: string): boolean {
+    return !!(allActiveTeams || []).find(t => t.match_id === matchId && t.user_id === userId)
+  }
 
   // Fetch last completed match with results
   const { data: lastMatch } = await supabaseAdmin
@@ -74,31 +91,76 @@ export default async function HomePage() {
           <p className="text-gray-500 text-sm">IPL 2026 Fantasy League</p>
         </div>
 
-        {/* Next Match Card */}
-        {nextMatch ? (
+        {/* Live Now — own section so multiple simultaneous live matches
+            (double-header days) all stay visible.  Each card is independent;
+            users can jump into either match's live scoring without waiting
+            for the first to finish. */}
+        {liveMatches.length > 0 && (
+          <div className="space-y-3">
+            <h2 className="text-sm font-semibold uppercase tracking-wider text-red-400 flex items-center gap-2">
+              <span className="inline-block w-2 h-2 rounded-full bg-red-500 animate-pulse"></span>
+              Live Now ({liveMatches.length})
+            </h2>
+            {liveMatches.map(m => (
+              <div key={m.id} className="bg-gray-900 rounded-2xl p-5 border border-red-900/60">
+                <div className="flex items-center justify-between mb-3">
+                  <span className="text-xs font-semibold uppercase tracking-wider text-red-400">🔴 Live</span>
+                  <span className="text-xs text-gray-500">
+                    Match {m.match_number} · {m.match_type.toUpperCase()}
+                  </span>
+                </div>
+                <div className="flex items-center justify-between mb-1">
+                  <span className="text-lg font-bold text-white">{m.team1}</span>
+                  <span className="text-gray-600 font-medium">vs</span>
+                  <span className="text-lg font-bold text-white">{m.team2}</span>
+                </div>
+                <p className="text-gray-500 text-xs mb-4">
+                  {new Date(m.scheduled_at).toLocaleString("en-IN", {
+                    dateStyle: "medium", timeStyle: "short", timeZone: "Asia/Kolkata"
+                  })} · {m.venue}
+                </p>
+                <div className="flex items-center justify-between">
+                  <span className="text-sm text-gray-400">
+                    💰 Pool: <span className="text-yellow-400 font-semibold">₹{getEntryFee(m.match_type) * (allUsers?.length || 0)}</span>
+                  </span>
+                  <a
+                    href={`/match/${m.id}`}
+                    className="bg-green-500 text-white font-semibold text-sm px-4 py-2 rounded-xl hover:bg-green-400 transition"
+                  >
+                    View Live →
+                  </a>
+                </div>
+              </div>
+            ))}
+          </div>
+        )}
+
+        {/* Hero — next pickable match (or first active match if everything
+            is already live).  This is what the user can take action on next. */}
+        {heroMatch ? (
           <div className="bg-gray-900 rounded-2xl p-5 border border-gray-800">
             <div className="flex items-center justify-between mb-3">
               <span className="text-xs font-semibold uppercase tracking-wider text-yellow-400">
-                {nextMatch.status === "live" ? "🔴 Live Now" :
-                 nextMatch.status === "locked" ? "🔒 Locked" : "⏳ Upcoming"}
+                {heroMatch.status === "live" ? "🔴 Live Now" :
+                 heroMatch.status === "locked" ? "🔒 Locked" : "⏳ Upcoming"}
               </span>
               <span className="text-xs text-gray-500">
-                Match {nextMatch.match_number} · {nextMatch.match_type.toUpperCase()}
+                Match {heroMatch.match_number} · {heroMatch.match_type.toUpperCase()}
               </span>
             </div>
             <div className="flex items-center justify-between mb-1">
-              <span className="text-lg font-bold text-white">{nextMatch.team1}</span>
+              <span className="text-lg font-bold text-white">{heroMatch.team1}</span>
               <span className="text-gray-600 font-medium">vs</span>
-              <span className="text-lg font-bold text-white">{nextMatch.team2}</span>
+              <span className="text-lg font-bold text-white">{heroMatch.team2}</span>
             </div>
             <p className="text-gray-500 text-xs mb-4">
-              {new Date(nextMatch.scheduled_at).toLocaleString("en-IN", {
+              {new Date(heroMatch.scheduled_at).toLocaleString("en-IN", {
                 dateStyle: "medium", timeStyle: "short", timeZone: "Asia/Kolkata"
-              })} · {nextMatch.venue}
+              })} · {heroMatch.venue}
             </p>
             {/* Who has submitted */}
             {(() => {
-              const { done, pending } = getSubmissionStatus(nextMatch.id)
+              const { done, pending } = getSubmissionStatus(heroMatch.id)
               return (done.length > 0 || pending.length > 0) ? (
                 <div className="flex flex-wrap gap-1.5 mb-4">
                   {done.map(name => (
@@ -113,57 +175,52 @@ export default async function HomePage() {
 
             <div className="flex items-center justify-between">
               <span className="text-sm text-gray-400">
-                💰 Entry: <span className="text-yellow-400 font-semibold">₹{getEntryFee(nextMatch.match_type)}/person</span>
-                <span className="text-gray-600 text-xs ml-2">Pool: ₹{getEntryFee(nextMatch.match_type) * (allUsers?.length || 0)}</span>
+                💰 Entry: <span className="text-yellow-400 font-semibold">₹{getEntryFee(heroMatch.match_type)}/person</span>
+                <span className="text-gray-600 text-xs ml-2">Pool: ₹{getEntryFee(heroMatch.match_type) * (allUsers?.length || 0)}</span>
               </span>
-              {nextMatch.status === "upcoming" ? (
+              {heroMatch.status === "upcoming" ? (
                 <a
-                  href={`/match/${nextMatch.id}/team`}
+                  href={`/match/${heroMatch.id}/team`}
                   className="bg-yellow-400 text-gray-900 font-semibold text-sm px-4 py-2 rounded-xl hover:bg-yellow-300 transition"
                 >
-                  Pick Team →
+                  {userHasTeam(heroMatch.id) ? "Edit Team →" : "Pick Team →"}
                 </a>
-              ) : nextMatch.status === "locked" ? (
+              ) : heroMatch.status === "locked" ? (
                 <a
-                  href={`/match/${nextMatch.id}/team`}
+                  href={`/match/${heroMatch.id}/team`}
                   className="bg-yellow-400 text-gray-900 font-semibold text-sm px-4 py-2 rounded-xl hover:bg-yellow-300 transition"
                 >
-                  {myNextTeam ? "Edit Team →" : "Pick Team →"}
+                  {userHasTeam(heroMatch.id) ? "Edit Team →" : "Pick Team →"}
                 </a>
-              ) : nextMatch.status === "live" ? (
+              ) : heroMatch.status === "live" ? (
                 <a
-                  href={`/match/${nextMatch.id}`}
+                  href={`/match/${heroMatch.id}`}
                   className="bg-green-500 text-white font-semibold text-sm px-4 py-2 rounded-xl hover:bg-green-400 transition"
                 >
                   View Live →
                 </a>
-              ) : nextMatch.status === "completed" ? (
-                <a
-                  href={`/match/${nextMatch.id}`}
-                  className="bg-gray-700 text-white font-semibold text-sm px-4 py-2 rounded-xl hover:bg-gray-600 transition"
-                >
-                  View Results →
-                </a>
               ) : null}
             </div>
           </div>
-        ) : (
+        ) : liveMatches.length === 0 && (
           <div className="bg-gray-900 rounded-2xl p-5 border border-gray-800 text-center text-gray-500">
             No upcoming matches. Season may not have started yet.
           </div>
         )}
 
-        {/* Upcoming Matches */}
-        {upcomingMatches && upcomingMatches.length > 1 && (
+        {/* Coming Up — remaining pickable matches.  Per-card team lookup
+            (no more "first / second match" hardcoding), so users can edit
+            their team for any future match shown here. */}
+        {remainingPickables.length > 0 && (
           <div className="bg-gray-900 rounded-2xl p-5 border border-gray-800">
             <h2 className="text-sm font-semibold text-gray-400 uppercase tracking-wider mb-3">Coming Up</h2>
             <div className="space-y-3">
-              {upcomingMatches.slice(1).map((m, idx) => {
-                const isSecond = idx === 0
-                const hasTeam = isSecond ? !!mySecondTeam : false
-                const canPick = isSecond && m.status === "upcoming"
+              {remainingPickables.map((m, idx) => {
+                const hasTeam = userHasTeam(m.id)
+                const canPick = m.status === "upcoming" || m.status === "locked"
+                const isLast = idx === remainingPickables.length - 1
                 return (
-                  <div key={m.id} className={`${isSecond ? "pb-3 border-b border-gray-800" : ""}`}>
+                  <div key={m.id} className={`${!isLast ? "pb-3 border-b border-gray-800" : ""}`}>
                     <div className="flex items-center justify-between">
                       <div>
                         <p className="text-white text-sm font-medium">{m.team1} vs {m.team2}</p>
