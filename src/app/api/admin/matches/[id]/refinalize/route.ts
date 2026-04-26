@@ -34,6 +34,10 @@ export async function POST(req: NextRequest, { params }: { params: Promise<{ id:
     return NextResponse.json({ error: "Unauthorized" }, { status: 401 })
   }
 
+  // ?force=1 — admin override.  See finalize/route.ts for the full rationale.
+  const url = new URL(req.url)
+  const force = url.searchParams.get("force") === "1"
+
   const { data: match } = await supabaseAdmin
     .from("matches")
     .select("*")
@@ -70,17 +74,20 @@ export async function POST(req: NextRequest, { params }: { params: Promise<{ id:
         error: `Scorecard only has ${scorecard.length} innings (source: ${source}). Both innings must be complete before re-finalizing.`,
       }, { status: 400 })
     }
-    // Per-innings sanity check — same as finalize.  A match that re-finalizes
-    // on partial data causes the exact bug the refinalize endpoint exists to
-    // fix, so we'd rather fail loudly here.
-    for (let i = 0; i < 2; i++) {
-      const inn = scorecard[i] as { batting?: unknown[]; bowling?: unknown[]; inning?: string }
-      const batN = inn.batting?.length ?? 0
-      const bowlN = inn.bowling?.length ?? 0
-      if (batN < 5 || bowlN < 3) {
-        return NextResponse.json({
-          error: `Innings ${i + 1} (${inn.inning ?? "?"}) looks incomplete: ${batN} batters, ${bowlN} bowlers (source: ${source}). Re-finalize needs ≥5 batters and ≥3 bowlers per innings.`,
-        }, { status: 400 })
+    // Per-innings sanity check — same as finalize (≥3 batters / ≥3 bowlers
+    // post-2026-04-26 retune).  Skip when ?force=1.  See finalize/route.ts
+    // for the threshold rationale.
+    if (!force) {
+      for (let i = 0; i < 2; i++) {
+        const inn = scorecard[i] as { batting?: unknown[]; bowling?: unknown[]; inning?: string }
+        const batN = inn.batting?.length ?? 0
+        const bowlN = inn.bowling?.length ?? 0
+        if (batN < 3 || bowlN < 3) {
+          return NextResponse.json({
+            error: `Innings ${i + 1} (${inn.inning ?? "?"}) looks incomplete: ${batN} batters, ${bowlN} bowlers (source: ${source}). Re-finalize needs ≥3 batters and ≥3 bowlers per innings. Use "Force Re-finalize" if the data IS complete.`,
+            canForce: true,
+          }, { status: 400 })
+        }
       }
     }
 

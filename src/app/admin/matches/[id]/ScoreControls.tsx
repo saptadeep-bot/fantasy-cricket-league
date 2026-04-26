@@ -15,6 +15,10 @@ export default function ScoreControls({ match }: { match: Match }) {
   const [message, setMessage] = useState<string | null>(null)
   const [announcement, setAnnouncement] = useState(match.result_announcement || "")
   const [newMatchId, setNewMatchId] = useState("")
+  // True after a finalize/refinalize attempt failed with `canForce: true`,
+  // i.e. the per-innings sanity guard rejected the data.  Surfaces the
+  // "Force …" button so the admin can override after eyeballing the data.
+  const [canForce, setCanForce] = useState(false)
 
   async function callApi(endpoint: string, body?: object) {
     const res = await fetch(endpoint, {
@@ -67,10 +71,17 @@ export default function ScoreControls({ match }: { match: Match }) {
     router.refresh()
   }
 
-  async function finalizeMatch() {
-    setLoading("finalize")
+  async function finalizeMatch(force = false) {
+    if (force && !confirm(
+      "Force Finalize bypasses the per-innings sanity check.\n\n" +
+      "Only use this when you've VERIFIED the scorecard is complete (e.g. a team posted 145/3 — only 4 batters actually came to crease, so the data IS final, but it looks thin).\n\n" +
+      "Total ≥15 entries is still required, so a truly empty scorecard can't slip through.\n\nProceed?"
+    )) return
+    setLoading(force ? "force-finalize" : "finalize")
     setMessage(null)
-    const data = await callApi(`/api/admin/matches/${match.id}/finalize`)
+    setCanForce(false)
+    const url = force ? `/api/admin/matches/${match.id}/finalize?force=1` : `/api/admin/matches/${match.id}/finalize`
+    const data = await callApi(url)
     if (data.success) {
       const winners = data.results
         ?.filter((r: { prize_won: number }) => r.prize_won > 0)
@@ -78,13 +89,14 @@ export default function ScoreControls({ match }: { match: Match }) {
       setMessage(`Match finalized! Prizes: ${winners || "No payouts"}`)
     } else {
       setMessage(`Error: ${data.error}`)
+      if (data.canForce) setCanForce(true)
     }
     setLoading(null)
     router.refresh()
   }
 
-  async function refinalizeMatch() {
-    if (!confirm(
+  async function refinalizeMatch(force = false) {
+    if (!force && !confirm(
       "Re-finalize this completed match?\n\n" +
       "This will:\n" +
       "• Re-fetch the final scorecard\n" +
@@ -94,9 +106,15 @@ export default function ScoreControls({ match }: { match: Match }) {
       "Settled payouts will stay marked settled. " +
       "Use this ONLY if the original finalize ran on incomplete data."
     )) return
-    setLoading("refinalize")
+    if (force && !confirm(
+      "Force Re-finalize bypasses the per-innings sanity check.\n\n" +
+      "Only use when you've verified the scorecard is genuinely complete.\n\nProceed?"
+    )) return
+    setLoading(force ? "force-refinalize" : "refinalize")
     setMessage(null)
-    const data = await callApi(`/api/admin/matches/${match.id}/refinalize`)
+    setCanForce(false)
+    const url = force ? `/api/admin/matches/${match.id}/refinalize?force=1` : `/api/admin/matches/${match.id}/refinalize`
+    const data = await callApi(url)
     if (data.success) {
       const winners = data.results
         ?.filter((r: { prize_won: number }) => r.prize_won > 0)
@@ -107,6 +125,30 @@ export default function ScoreControls({ match }: { match: Match }) {
       )
     } else {
       setMessage(`Error: ${data.error}`)
+      if (data.canForce) setCanForce(true)
+    }
+    setLoading(null)
+    router.refresh()
+  }
+
+  async function recoverAbandoned() {
+    if (!confirm(
+      "Recover this abandoned match?\n\n" +
+      "This will:\n" +
+      "• Reverse the rollover added to the next match (so the prize doesn't double-count)\n" +
+      "• Flip status from 'abandoned' back to 'live' so you can finalize\n\n" +
+      "Use this when a match was wrongly abandoned (e.g. finalize was blocked by a sanity guard).\n\nProceed?"
+    )) return
+    setLoading("recover")
+    setMessage(null)
+    const data = await callApi(`/api/admin/matches/${match.id}/recover-abandoned`)
+    if (data.success) {
+      const rev = data.reversedFrom
+        ? `Reversed ₹${data.rolloverReversed} from "${data.reversedFrom.name}" (rollover ${data.reversedFrom.before} → ${data.reversedFrom.after}). `
+        : ""
+      setMessage(`Recovered. ${rev}Status is now LIVE. Click "Finalize & Pay Out" next.`)
+    } else {
+      setMessage(`Error: ${data.error}`)
     }
     setLoading(null)
     router.refresh()
@@ -115,6 +157,7 @@ export default function ScoreControls({ match }: { match: Match }) {
   if (match.status === "upcoming") return null
 
   const isCompleted = match.status === "completed"
+  const isAbandoned = match.status === "abandoned"
 
   return (
     <div className="bg-gray-900 border border-gray-800 rounded-2xl p-5 space-y-4">
@@ -142,11 +185,21 @@ export default function ScoreControls({ match }: { match: Match }) {
         )}
         {match.status === "live" && (
           <button
-            onClick={finalizeMatch}
+            onClick={() => finalizeMatch(false)}
             disabled={!!loading}
             className="bg-yellow-400 text-gray-900 font-semibold px-4 py-2 rounded-xl text-sm hover:bg-yellow-300 transition disabled:opacity-50"
           >
             {loading === "finalize" ? "Finalizing..." : "Finalize & Pay Out"}
+          </button>
+        )}
+        {match.status === "live" && canForce && (
+          <button
+            onClick={() => finalizeMatch(true)}
+            disabled={!!loading}
+            className="bg-orange-600 text-white font-semibold px-4 py-2 rounded-xl text-sm hover:bg-orange-500 transition disabled:opacity-50"
+            title="Bypass the per-innings sanity guard. Use only when the data is verified complete."
+          >
+            {loading === "force-finalize" ? "Forcing…" : "Force Finalize (data IS complete)"}
           </button>
         )}
         {!["completed", "abandoned"].includes(match.status) && (
@@ -158,14 +211,34 @@ export default function ScoreControls({ match }: { match: Match }) {
             Mark Abandoned
           </button>
         )}
+        {isAbandoned && (
+          <button
+            onClick={recoverAbandoned}
+            disabled={!!loading}
+            className="bg-emerald-600 text-white font-semibold px-4 py-2 rounded-xl text-sm hover:bg-emerald-500 transition disabled:opacity-50"
+            title="Reverse the rollover and flip status back to live, so you can finalize this match."
+          >
+            {loading === "recover" ? "Recovering…" : "Recover Match (un-abandon)"}
+          </button>
+        )}
         {isCompleted && (
           <button
-            onClick={refinalizeMatch}
+            onClick={() => refinalizeMatch(false)}
             disabled={!!loading}
             className="bg-purple-700 text-white font-semibold px-4 py-2 rounded-xl text-sm hover:bg-purple-600 transition disabled:opacity-50"
             title="Re-fetch the scorecard and recompute all player points + prizes. Use if the original finalize ran on incomplete data."
           >
             {loading === "refinalize" ? "Re-finalizing…" : "Re-finalize (fix scores)"}
+          </button>
+        )}
+        {isCompleted && canForce && (
+          <button
+            onClick={() => refinalizeMatch(true)}
+            disabled={!!loading}
+            className="bg-orange-600 text-white font-semibold px-4 py-2 rounded-xl text-sm hover:bg-orange-500 transition disabled:opacity-50"
+            title="Bypass the per-innings sanity guard."
+          >
+            {loading === "force-refinalize" ? "Forcing…" : "Force Re-finalize"}
           </button>
         )}
       </div>

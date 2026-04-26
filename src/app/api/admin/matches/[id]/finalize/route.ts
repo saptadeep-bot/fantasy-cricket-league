@@ -26,6 +26,14 @@ export async function POST(req: NextRequest, { params }: { params: Promise<{ id:
     return NextResponse.json({ error: "Unauthorized" }, { status: 401 })
   }
 
+  // ?force=1 — admin override that skips the per-innings sanity guard.
+  // Use ONLY when the data is genuinely complete but happens to look thin
+  // (e.g. team posted 145/3 → only 4 batter entries, which the conservative
+  // per-innings guard rejects as "partial").  The total≥15 guard still
+  // applies so a truly empty scorecard can never be force-finalized.
+  const url = new URL(req.url)
+  const force = url.searchParams.get("force") === "1"
+
   const { data: match } = await supabaseAdmin
     .from("matches")
     .select("*")
@@ -69,25 +77,43 @@ export async function POST(req: NextRequest, { params }: { params: Promise<{ id:
     // where cricapi's fantasyEnabled flipped early but its scorecard was
     // still populating player-by-player.  We now enforce BOTH:
     //   (1) total ≥ 15 — blocks thin scorecards (original guard)
-    //   (2) each of the first 2 innings has ≥ 5 batters AND ≥ 3 bowlers —
+    //   (2) each of the first 2 innings has ≥ 3 batters AND ≥ 3 bowlers —
     //       blocks asymmetric partials (innings 1 complete, innings 2 empty)
     //       that the total-only guard would let through.
+    //
+    // Threshold tuning history:
+    //   - 2026-04-18: introduced as ≥5 batters / ≥3 bowlers
+    //   - 2026-04-26: lowered to ≥3 batters because cricapi's `batting` array
+    //     only contains players who actually came to crease.  A team that
+    //     posted 145/3 has just 4 entries (3 dismissed + 1 not-out striker),
+    //     and the ≥5 guard incorrectly blocked Punjab vs Delhi finalize.
+    //     ≥3 batters still catches the partial-data bug (mid-innings flip
+    //     typically has 0–2 entries) without false-positiving on legit
+    //     low-wickets innings.
+    //
     // Super overs / 3rd innings are not checked — they're optional and often
     // tiny even in well-formed scorecards.
+    //
+    // ?force=1 admin override skips this per-innings check entirely.  The
+    // total≥15 guard still applies so a truly empty scorecard can't slip
+    // through even with force.
     const playerCount = countScorecardPlayers(scorecard as unknown[])
     if (playerCount < 15) {
       return NextResponse.json({
         error: `Scorecard looks incomplete — only ${playerCount} batter/bowler entries across both innings (source: ${source}). A full T20 scorecard should have 20+. Wait a minute and try again.`
       }, { status: 400 })
     }
-    for (let i = 0; i < 2; i++) {
-      const inn = scorecard[i] as { batting?: unknown[]; bowling?: unknown[]; inning?: string }
-      const batN = inn.batting?.length ?? 0
-      const bowlN = inn.bowling?.length ?? 0
-      if (batN < 5 || bowlN < 3) {
-        return NextResponse.json({
-          error: `Innings ${i + 1} (${inn.inning ?? "?"}) looks incomplete: ${batN} batters, ${bowlN} bowlers (source: ${source}). Need ≥5 batters and ≥3 bowlers per innings to finalize safely.`
-        }, { status: 400 })
+    if (!force) {
+      for (let i = 0; i < 2; i++) {
+        const inn = scorecard[i] as { batting?: unknown[]; bowling?: unknown[]; inning?: string }
+        const batN = inn.batting?.length ?? 0
+        const bowlN = inn.bowling?.length ?? 0
+        if (batN < 3 || bowlN < 3) {
+          return NextResponse.json({
+            error: `Innings ${i + 1} (${inn.inning ?? "?"}) looks incomplete: ${batN} batters, ${bowlN} bowlers (source: ${source}). Need ≥3 batters and ≥3 bowlers per innings to finalize safely. If the data IS complete (e.g. low-wickets innings), use the "Force Finalize" button.`,
+            canForce: true,
+          }, { status: 400 })
+        }
       }
     }
 
