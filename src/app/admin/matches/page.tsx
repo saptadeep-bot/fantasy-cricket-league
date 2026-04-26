@@ -16,13 +16,22 @@ export default async function AdminMatchesPage() {
     .not("status", "eq", "abandoned")
     .order("scheduled_at", { ascending: true })
 
-  // Completed / abandoned — surfaced separately so admins can re-finalize
-  // or re-open a match if its scores were saved on bad data.  Most recent
-  // first, cap at 20 so the list doesn't grow unbounded across a season.
-  const { data: finishedMatches } = await supabaseAdmin
+  // Abandoned matches need admin attention — they may have been abandoned
+  // wrongly (e.g. finalize blocked by an over-strict guard) and should be
+  // recovered.  Surface them in their own ALWAYS-VISIBLE section so they
+  // can't get buried under the completed-archive details/summary.
+  const { data: abandonedMatches } = await supabaseAdmin
     .from("matches")
     .select("*")
-    .in("status", ["completed", "abandoned"])
+    .eq("status", "abandoned")
+    .order("scheduled_at", { ascending: false })
+
+  // Completed — archive section, collapsed by default.  Most recent first,
+  // capped at 20 so the list doesn't grow unbounded across a season.
+  const { data: completedMatches } = await supabaseAdmin
+    .from("matches")
+    .select("*")
+    .eq("status", "completed")
     .order("scheduled_at", { ascending: false })
     .limit(20)
 
@@ -67,14 +76,43 @@ export default async function AdminMatchesPage() {
           )}
         </div>
 
-        {finishedMatches && finishedMatches.length > 0 && (
-          <details className="mt-8 bg-gray-900 border border-gray-800 rounded-2xl p-4">
+        {/* Abandoned — prominent, always visible, calls attention. */}
+        {abandonedMatches && abandonedMatches.length > 0 && (
+          <div className="mt-8 bg-red-950/40 border border-red-800/50 rounded-2xl p-4">
+            <h2 className="text-red-300 font-semibold text-sm mb-1">
+              Abandoned ({abandonedMatches.length}) — needs attention
+            </h2>
+            <p className="text-red-400/70 text-xs mb-4">
+              Click into a match to recover (un-abandon) and finalize it.
+            </p>
+            <div className="space-y-2">
+              {abandonedMatches.map((m) => (
+                <a key={m.id} href={`/admin/matches/${m.id}`} className="bg-gray-950 border border-red-900/50 rounded-xl p-3 flex items-center justify-between hover:border-red-600 transition block">
+                  <div>
+                    <p className="text-white text-sm font-medium">{m.name}</p>
+                    <p className="text-gray-500 text-xs">
+                      {new Date(m.scheduled_at).toLocaleString("en-IN", { dateStyle: "medium", timeStyle: "short", timeZone: "Asia/Kolkata" })}
+                      {" · "}₹{m.base_prize + (m.rollover_added || 0)}
+                    </p>
+                  </div>
+                  <span className="text-xs px-2 py-1 rounded-full font-medium bg-red-900 text-red-300">
+                    abandoned
+                  </span>
+                </a>
+              ))}
+            </div>
+          </div>
+        )}
+
+        {/* Completed — archive, collapsed by default. */}
+        {completedMatches && completedMatches.length > 0 && (
+          <details className="mt-6 bg-gray-900 border border-gray-800 rounded-2xl p-4">
             <summary className="cursor-pointer text-white font-semibold text-sm">
-              Completed &amp; abandoned ({finishedMatches.length})
+              Completed ({completedMatches.length})
               <span className="text-gray-500 font-normal ml-2">— open to re-finalize if scores were wrong</span>
             </summary>
             <div className="space-y-2 mt-4">
-              {finishedMatches.map((m) => (
+              {completedMatches.map((m) => (
                 <a key={m.id} href={`/admin/matches/${m.id}`} className="bg-gray-950 border border-gray-800 rounded-xl p-3 flex items-center justify-between hover:border-gray-600 transition block">
                   <div>
                     <p className="text-white text-sm font-medium">{m.name}</p>
@@ -82,11 +120,8 @@ export default async function AdminMatchesPage() {
                       {new Date(m.scheduled_at).toLocaleString("en-IN", { dateStyle: "medium", timeStyle: "short", timeZone: "Asia/Kolkata" })}
                     </p>
                   </div>
-                  <span className={`text-xs px-2 py-1 rounded-full font-medium ${
-                    m.status === "completed" ? "bg-gray-800 text-gray-400" :
-                    "bg-red-900 text-red-400"
-                  }`}>
-                    {m.status}
+                  <span className="text-xs px-2 py-1 rounded-full font-medium bg-gray-800 text-gray-400">
+                    completed
                   </span>
                 </a>
               ))}

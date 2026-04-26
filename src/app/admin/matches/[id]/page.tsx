@@ -47,6 +47,7 @@ export default async function AdminMatchDetailPage({ params }: { params: Promise
               match.status === "locked" ? "bg-blue-900 text-blue-400" :
               match.status === "live" ? "bg-green-900 text-green-400" :
               match.status === "completed" ? "bg-gray-800 text-gray-400" :
+              match.status === "abandoned" ? "bg-red-900 text-red-300" :
               "bg-gray-800 text-yellow-400"
             }`}>{match.status}</span>
             <span className="text-gray-500 text-xs">Prize: ₹{match.base_prize + (match.rollover_added || 0)}</span>
