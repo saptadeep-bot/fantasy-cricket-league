@@ -78,8 +78,16 @@ export default function LockMatchPanel({
           c.inserted ? `+${c.inserted} new` : null,
           c.entitysportOnly ? `${c.entitysportOnly} from EntitySport` : null,
           c.preserved ? `${c.preserved} preserved` : null,
+          c.rogueCleaned ? `${c.rogueCleaned} wrong-team rows removed` : null,
         ].filter(Boolean).join(", ")
-        setMessage(`Squad updated (${breakdown}). Friends can pick their teams!`)
+        // `warning` is non-fatal — squad partially fetched, e.g. cricapi
+        // returned the wrong team for one side.  Show it in place of the
+        // success message so the admin can't miss it.
+        if (data.warning) {
+          setMessage(`⚠️ ${data.warning} (${breakdown})`)
+        } else {
+          setMessage(`Squad updated (${breakdown}). Friends can pick their teams!`)
+        }
       } else {
         setMessage(`Error: ${data.error}`)
       }
@@ -217,7 +225,15 @@ export default function LockMatchPanel({
           >
             {loading ? "Fetching..." : squadSaved ? "Re-fetch Squad" : "Fetch Squad from API"}
           </button>
-          {message && <p className="mt-2 text-sm text-gray-300">{message}</p>}
+          {message && (
+            <p className={`mt-2 text-sm ${
+              message.startsWith("Error") || message.startsWith("Network") ? "text-red-400" :
+              message.startsWith("⚠️") ? "text-yellow-400" :
+              "text-gray-300"
+            }`}>
+              {message}
+            </p>
+          )}
 
           {/* Safety valve: manual add for players that neither feed returned */}
           {squadSaved && (

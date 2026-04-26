@@ -165,6 +165,22 @@ function sameTeam(a: string, b: string): boolean {
   return na.includes(nb) || nb.includes(na)
 }
 
+// Canonicalise a team name returned by cricapi/EntitySport against the
+// match's actual team1/team2.  Returns the canonical DB string if there's
+// a match, or null if the API gave us a rogue team (e.g. cricapi's pre-
+// toss squad endpoint occasionally returns the wrong team — we saw it
+// return Lahore Qalandars for an MI vs SRH fixture days before the toss).
+//
+// Returning null lets the caller filter out players belonging to a team
+// that has nothing to do with this match, instead of inserting them and
+// letting users draft fictional squads.
+function canonicalTeam(apiTeamName: string, t1: string, t2: string): string | null {
+  if (!apiTeamName) return null
+  if (sameTeam(apiTeamName, t1)) return t1
+  if (sameTeam(apiTeamName, t2)) return t2
+  return null
+}
+
 function mergeSquads(
   cricapiPlayers: CricapiSquadPlayer[],
   esPlayers: EntitySportSquadPlayer[],
@@ -286,13 +302,56 @@ export async function POST(req: NextRequest, { params }: { params: Promise<{ id:
       }
     }
 
-    const cricapiPlayers = cricapiResult.players ?? []
-    const esPlayers = esResult.players ?? []
+    const cricapiPlayersRaw = cricapiResult.players ?? []
+    const esPlayersRaw = esResult.players ?? []
 
-    if (cricapiPlayers.length === 0 && esPlayers.length === 0) {
+    if (cricapiPlayersRaw.length === 0 && esPlayersRaw.length === 0) {
       return NextResponse.json({
         error: `Both squad sources returned empty. cricapi: ${cricapiResult.reason} | entitysport: ${esResult.reason}`,
       }, { status: 500 })
+    }
+
+    // Team-name validation — reject any player whose team doesn't match
+    // either of this match's two configured teams.  cricapi's pre-toss
+    // /match_squad endpoint occasionally returns wrong-team data (we saw
+    // it return Lahore Qalandars instead of SRH for an MI vs SRH fixture).
+    // Without this filter, fictional squads pollute the DB and users draft
+    // players from teams that aren't even playing.
+    //
+    // We also re-label the team to the canonical DB string (so cricapi's
+    // "Mumbai Indians" and ES's "Mumbai Indians" both store as the exact
+    // value of match.team1, no drift).
+    const cricapiPlayers: CricapiSquadPlayer[] = []
+    const cricapiRejectedTeams = new Set<string>()
+    for (const p of cricapiPlayersRaw) {
+      const canon = canonicalTeam(p.team, matchTeam1, matchTeam2)
+      if (canon) {
+        cricapiPlayers.push({ ...p, team: canon })
+      } else {
+        cricapiRejectedTeams.add(p.team)
+      }
+    }
+    const esPlayers: EntitySportSquadPlayer[] = []
+    const esRejectedTeams = new Set<string>()
+    for (const p of esPlayersRaw) {
+      const canon = canonicalTeam(p.team, matchTeam1, matchTeam2)
+      if (canon) {
+        esPlayers.push({ ...p, team: canon })
+      } else {
+        esRejectedTeams.add(p.team)
+      }
+    }
+
+    if (cricapiPlayers.length === 0 && esPlayers.length === 0) {
+      // Every team that came back was rogue — refuse to insert anything.
+      const rejectedAll = [...cricapiRejectedTeams, ...esRejectedTeams].filter(Boolean)
+      return NextResponse.json({
+        error: `No squad data for ${matchTeam1} or ${matchTeam2}.${rejectedAll.length > 0 ? ` Both APIs returned wrong teams: ${rejectedAll.join(", ")}.` : ""} This usually means cricapi has stale/wrong data for this fixture pre-toss. Try again closer to match time, or use API Match ID override if cricapi has a different ID for this fixture.`,
+        diagnostic: {
+          cricapi: { reason: cricapiResult.reason, rejectedTeams: [...cricapiRejectedTeams] },
+          entitysport: { reason: esResult.reason, rejectedTeams: [...esRejectedTeams] },
+        },
+      }, { status: 422 })
     }
 
     const { merged, cricapiOnly, esOnly, both } = mergeSquads(cricapiPlayers, esPlayers)
@@ -309,6 +368,29 @@ export async function POST(req: NextRequest, { params }: { params: Promise<{ id:
 
     const existingById = new Map<string, NonNullable<typeof existingRows>[number]>()
     for (const r of existingRows || []) existingById.set(r.cricketdata_player_id, r)
+
+    // Cleanup: identify existing rows whose team name doesn't match either
+    // of the configured match teams.  These are stale rogue inserts from a
+    // previous bad fetch (e.g. the Lahore Qalandars / SRH bug).  We delete
+    // them — they can't possibly be legitimate players for this match, so
+    // the "non-destructive preserve" policy doesn't apply.  Manual-add and
+    // live-auto-add players DO have valid team names, so they're untouched.
+    const rogueExisting = (existingRows || []).filter(r =>
+      !canonicalTeam(r.team ?? "", matchTeam1, matchTeam2),
+    )
+    let rogueCleaned = 0
+    if (rogueExisting.length > 0) {
+      const { error: cleanupErr } = await supabaseAdmin
+        .from("match_players")
+        .delete()
+        .in("id", rogueExisting.map(r => r.id))
+      if (!cleanupErr) {
+        rogueCleaned = rogueExisting.length
+        // Also remove them from existingById so they don't get treated as
+        // "already exists" during the upsert split below.
+        for (const r of rogueExisting) existingById.delete(r.cricketdata_player_id)
+      }
+    }
 
     // For every merged player: UPSERT by (match_id, cricketdata_player_id).
     // Supabase's upsert with onConflict does exactly this.  We split the rows
@@ -396,6 +478,17 @@ export async function POST(req: NextRequest, { params }: { params: Promise<{ id:
       .order("team")
       .order("role")
 
+    // Coverage check: did we actually get players for BOTH configured
+    // teams?  If only one is represented in the merged set, the admin
+    // needs to know — they should retry closer to match time rather than
+    // lock in with half a squad.
+    const teamsCovered = new Set(merged.map(m => m.team))
+    const missingTeams = [matchTeam1, matchTeam2].filter(t => t && !teamsCovered.has(t))
+    const allRejectedTeams = [
+      ...cricapiRejectedTeams,
+      ...esRejectedTeams,
+    ].filter(Boolean)
+
     return NextResponse.json({
       success: true,
       players: finalPlayers || [],
@@ -411,6 +504,19 @@ export async function POST(req: NextRequest, { params }: { params: Promise<{ id:
         inserted: toInsert.length,
         updated: toUpdate.length,
         preserved: preserved.length,
+        rogueCleaned,
+      },
+      // `warning` is non-fatal — squad partially fetched.  UI surfaces this
+      // so admin can decide whether to retry later or accept a one-team
+      // squad and add the other side manually.
+      warning: missingTeams.length > 0
+        ? `Squad fetched for ${[...teamsCovered].join(", ") || "(none)"} but missing for ${missingTeams.join(", ")}.${allRejectedTeams.length > 0 ? ` API returned wrong team(s): ${allRejectedTeams.join(", ")}.` : ""} Pre-toss data is often unreliable — retry closer to match time.`
+        : (allRejectedTeams.length > 0
+          ? `Filtered out wrong-team data: ${allRejectedTeams.join(", ")}. Both correct teams' squads were fetched successfully.`
+          : null),
+      rejected: {
+        cricapi: [...cricapiRejectedTeams],
+        entitysport: [...esRejectedTeams],
       },
     })
   } catch (err) {
