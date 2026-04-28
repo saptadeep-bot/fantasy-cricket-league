@@ -28,6 +28,12 @@ const ROLE_COLORS: Record<string, string> = {
   WK: "bg-yellow-900 text-yellow-300",
 }
 
+interface BreakdownComponent {
+  section: "batting" | "bowling" | "fielding"
+  label: string
+  points: number
+}
+
 interface Player {
   cricketdata_player_id: string
   name: string
@@ -35,6 +41,79 @@ interface Player {
   role: string
   fantasy_points: number
   last_updated?: string
+  // Per-player line-item breakdown of how the fantasy total was earned.
+  // Populated for matches finalized on or after 2026-04-28; null for older
+  // matches (column was added then) — UI shows "Breakdown not available".
+  points_breakdown?: BreakdownComponent[] | null
+}
+
+// Inline breakdown panel — shown when the user taps a player on a completed
+// match.  Groups the line items by section, shows raw stats embedded in the
+// labels (e.g. "Sixes (4 × 2)"), and reconciles the section subtotals against
+// the player's stored fantasy_points so the user can tally cleanly.
+function BreakdownPanel({ player, multiplier }: { player: Player; multiplier: number }) {
+  const components = player.points_breakdown ?? []
+  if (components.length === 0) {
+    return (
+      <div className="bg-gray-950 border border-gray-800 rounded-lg px-3 py-2 text-xs text-gray-500">
+        Breakdown not available for this match.
+      </div>
+    )
+  }
+  const grouped: Record<"batting" | "bowling" | "fielding", BreakdownComponent[]> = {
+    batting: [],
+    bowling: [],
+    fielding: [],
+  }
+  for (const c of components) grouped[c.section].push(c)
+  const sectionTotal = (s: "batting" | "bowling" | "fielding") =>
+    grouped[s].reduce((sum, c) => sum + c.points, 0)
+  const grandTotal = sectionTotal("batting") + sectionTotal("bowling") + sectionTotal("fielding")
+  const sectionTitle: Record<"batting" | "bowling" | "fielding", string> = {
+    batting: "🏏 Batting",
+    bowling: "🎯 Bowling",
+    fielding: "🧤 Fielding",
+  }
+  return (
+    <div className="bg-gray-950 border border-gray-800 rounded-lg px-3 py-2 space-y-2 mt-1">
+      {(["batting", "bowling", "fielding"] as const).map(section =>
+        grouped[section].length > 0 ? (
+          <div key={section}>
+            <div className="flex items-center justify-between text-xs font-semibold text-gray-300 mb-0.5">
+              <span>{sectionTitle[section]}</span>
+              <span className={sectionTotal(section) >= 0 ? "text-green-400" : "text-red-400"}>
+                {sectionTotal(section) >= 0 ? "+" : ""}{Math.round(sectionTotal(section) * 10) / 10}
+              </span>
+            </div>
+            <div className="space-y-0.5">
+              {grouped[section].map((c, i) => (
+                <div key={i} className="flex items-center justify-between text-xs">
+                  <span className="text-gray-400">{c.label}</span>
+                  <span className={c.points > 0 ? "text-gray-300" : c.points < 0 ? "text-red-400" : "text-gray-600"}>
+                    {c.points > 0 ? "+" : ""}{c.points}
+                  </span>
+                </div>
+              ))}
+            </div>
+          </div>
+        ) : null,
+      )}
+      <div className="border-t border-gray-800 pt-1.5 flex items-center justify-between text-xs">
+        <span className="text-gray-300 font-semibold">Player total</span>
+        <span className="text-white font-semibold">{Math.round(grandTotal * 10) / 10}</span>
+      </div>
+      {multiplier > 1 && (
+        <div className="flex items-center justify-between text-xs">
+          <span className="text-yellow-400 font-semibold">
+            {multiplier === 2 ? "Captain × 2" : "Vice-captain × 1.5"}
+          </span>
+          <span className="text-yellow-400 font-semibold">
+            = {Math.round(grandTotal * multiplier * 10) / 10}
+          </span>
+        </div>
+      )}
+    </div>
+  )
 }
 
 interface Team {
@@ -84,6 +163,11 @@ export default function LiveMatchView({
   const [liveTeams, setLiveTeams] = useState<Team[]>(initialTeams)
   const [lastUpdated, setLastUpdated] = useState<Date | null>(null)
   const [activeTab, setActiveTab] = useState<"scores" | "myteam" | "allteams">("scores")
+  // Tracks which player's breakdown is currently expanded.  Composite key
+  // ("teamId:playerId") so the same player on two different friends' teams
+  // can be opened independently.  Only meaningful when match is completed.
+  const [expandedKey, setExpandedKey] = useState<string | null>(null)
+  const breakdownAvailable = match.status === "completed"
 
   // Always derive myTeam from live teams state so it updates when IDs change
   const myTeam = liveTeams.find(t => t.user_id === currentUserId) || null
@@ -351,20 +435,40 @@ export default function LiveMatchView({
                 const isVc = pid === myTeam.vice_captain_id
                 const mult = isCaptain ? 2 : isVc ? 1.5 : 1
                 const pts = (player.fantasy_points || 0) * mult
+                const key = `${myTeam.id}:${pid}`
+                const isExpanded = expandedKey === key
+                const Tag = breakdownAvailable ? "button" : "div"
                 return (
-                  <div key={pid} className="bg-gray-900 border border-gray-800 rounded-xl p-3 flex items-center justify-between">
-                    <div className="flex items-center gap-2">
-                      <span className={`text-xs px-1.5 py-0.5 rounded font-medium ${ROLE_COLORS[player.role] || "bg-gray-800 text-gray-300"}`}>
-                        {player.role}
-                      </span>
-                      <span className="text-white text-sm">{player.name}</span>
-                      {isCaptain && <span className="text-xs bg-yellow-400 text-gray-900 px-1.5 rounded font-bold">C</span>}
-                      {isVc && <span className="text-xs bg-gray-400 text-gray-900 px-1.5 rounded font-bold">VC</span>}
-                    </div>
-                    <div className="text-right">
-                      <p className="text-white font-medium text-sm">{Math.round(pts * 10) / 10}</p>
-                      {mult > 1 && <p className="text-gray-500 text-xs">{player.fantasy_points} × {mult}</p>}
-                    </div>
+                  <div key={pid} className="bg-gray-900 border border-gray-800 rounded-xl">
+                    <Tag
+                      onClick={breakdownAvailable ? () => setExpandedKey(isExpanded ? null : key) : undefined}
+                      className={`w-full p-3 flex items-center justify-between text-left ${
+                        breakdownAvailable ? "hover:bg-gray-800 transition" : ""
+                      }`}
+                    >
+                      <div className="flex items-center gap-2">
+                        <span className={`text-xs px-1.5 py-0.5 rounded font-medium ${ROLE_COLORS[player.role] || "bg-gray-800 text-gray-300"}`}>
+                          {player.role}
+                        </span>
+                        <span className="text-white text-sm">{player.name}</span>
+                        {isCaptain && <span className="text-xs bg-yellow-400 text-gray-900 px-1.5 rounded font-bold">C</span>}
+                        {isVc && <span className="text-xs bg-gray-400 text-gray-900 px-1.5 rounded font-bold">VC</span>}
+                      </div>
+                      <div className="flex items-center gap-2">
+                        <div className="text-right">
+                          <p className="text-white font-medium text-sm">{Math.round(pts * 10) / 10}</p>
+                          {mult > 1 && <p className="text-gray-500 text-xs">{player.fantasy_points} × {mult}</p>}
+                        </div>
+                        {breakdownAvailable && (
+                          <span className="text-gray-500 text-xs">{isExpanded ? "▾" : "▸"}</span>
+                        )}
+                      </div>
+                    </Tag>
+                    {isExpanded && (
+                      <div className="px-3 pb-3">
+                        <BreakdownPanel player={player} multiplier={mult} />
+                      </div>
+                    )}
                   </div>
                 )
               })}
@@ -401,15 +505,31 @@ export default function LiveMatchView({
                     const isCaptain = pid === team.captain_id
                     const isVc = pid === team.vice_captain_id
                     const mult = isCaptain ? 2 : isVc ? 1.5 : 1
+                    const key = `${team.id}:${pid}`
+                    const isExpanded = expandedKey === key
+                    const Tag = breakdownAvailable ? "button" : "div"
                     return (
-                      <div key={pid} className="flex items-center justify-between text-sm">
-                        <div className="flex items-center gap-2">
-                          <span className={`text-xs px-1 py-0.5 rounded ${ROLE_COLORS[player.role] || "bg-gray-800 text-gray-300"}`}>{player.role}</span>
-                          <span className="text-gray-300">{player.name}</span>
-                          {isCaptain && <span className="text-xs text-yellow-400 font-bold">(C)</span>}
-                          {isVc && <span className="text-xs text-gray-400 font-bold">(VC)</span>}
-                        </div>
-                        <span className="text-gray-400">{Math.round((player.fantasy_points || 0) * mult * 10) / 10}</span>
+                      <div key={pid}>
+                        <Tag
+                          onClick={breakdownAvailable ? () => setExpandedKey(isExpanded ? null : key) : undefined}
+                          className={`w-full flex items-center justify-between text-sm text-left ${
+                            breakdownAvailable ? "hover:bg-gray-800/50 rounded px-1 py-0.5 transition" : ""
+                          }`}
+                        >
+                          <div className="flex items-center gap-2">
+                            <span className={`text-xs px-1 py-0.5 rounded ${ROLE_COLORS[player.role] || "bg-gray-800 text-gray-300"}`}>{player.role}</span>
+                            <span className="text-gray-300">{player.name}</span>
+                            {isCaptain && <span className="text-xs text-yellow-400 font-bold">(C)</span>}
+                            {isVc && <span className="text-xs text-gray-400 font-bold">(VC)</span>}
+                          </div>
+                          <div className="flex items-center gap-2">
+                            <span className="text-gray-400">{Math.round((player.fantasy_points || 0) * mult * 10) / 10}</span>
+                            {breakdownAvailable && (
+                              <span className="text-gray-500 text-xs">{isExpanded ? "▾" : "▸"}</span>
+                            )}
+                          </div>
+                        </Tag>
+                        {isExpanded && <BreakdownPanel player={player} multiplier={mult} />}
                       </div>
                     )
                   })}

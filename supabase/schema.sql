@@ -45,6 +45,7 @@ create table match_players (
   fantasy_points decimal(6,1) default 0,
   is_playing boolean default true,
   is_substitute boolean default false,
+  points_breakdown jsonb,
   last_updated timestamptz default now(),
   unique(match_id, cricketdata_player_id)
 );

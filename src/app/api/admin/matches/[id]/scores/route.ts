@@ -332,9 +332,13 @@ async function fetchAndSaveScores(matchId: string, cricketdataMatchId: string): 
 
 // ─── DB read helpers ──────────────────────────────────────────────────────────
 async function readPlayersFromDb(matchId: string) {
+  // SELECT * so we get points_breakdown (added 2026-04-28) without hard-
+  // wiring the column.  If the migration hasn't been run yet, the column
+  // is just missing from the rows — the client treats that as "breakdown
+  // not available" rather than 400-ing on the read.
   const { data } = await supabaseAdmin
     .from("match_players")
-    .select("cricketdata_player_id, name, team, role, fantasy_points, last_updated")
+    .select("*")
     .eq("match_id", matchId)
     .order("fantasy_points", { ascending: false })
   return data || []

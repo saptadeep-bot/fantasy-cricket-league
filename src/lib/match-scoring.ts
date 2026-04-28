@@ -1,6 +1,6 @@
 // src/lib/match-scoring.ts
 import { supabaseAdmin } from "@/lib/supabase"
-import { calculateFantasyPoints } from "@/lib/fantasy-points"
+import { calculateFantasyPoints, type BreakdownComponent } from "@/lib/fantasy-points"
 
 export interface ComputeResult {
   updated: number
@@ -8,6 +8,15 @@ export interface ComputeResult {
   remapped: number
   autoAdded: number
   missed: string[]
+}
+
+// Detect a Postgrest "points_breakdown column doesn't exist" error so writes
+// can transparently degrade if the migration hasn't been run yet.  We don't
+// want a live-scoring path to die because the breakdown column is missing —
+// fall back to writing only fantasy_points and continue.
+function isPointsBreakdownColumnMissing(msg: string | null | undefined): boolean {
+  if (!msg) return false
+  return /points_breakdown/i.test(msg) && /(column|does not exist|schema cache)/i.test(msg)
 }
 
 // ─── Name normalisation & matching ───────────────────────────────────────────
@@ -113,10 +122,10 @@ export async function computeAndSave(matchId: string, scorecard: unknown[]): Pro
   const teamMap = playerTeamsFromScorecard(scorecard as any[])
 
   const now = new Date().toISOString()
-  const directUpdates: Array<{ id: string; points: number }> = []
-  const idRemaps: Array<{ oldId: string; newId: string; fantasyPoints: number }> = []
+  const directUpdates: Array<{ id: string; points: number; breakdown: BreakdownComponent[] }> = []
+  const idRemaps: Array<{ oldId: string; newId: string; fantasyPoints: number; breakdown: BreakdownComponent[] }> = []
   const autoInsertPlayers: Array<{
-    cricketdata_player_id: string; name: string; team: string; role: string; fantasy_points: number
+    cricketdata_player_id: string; name: string; team: string; role: string; fantasy_points: number; breakdown: BreakdownComponent[]
   }> = []
   const autoInsertNames: string[] = []
 
@@ -124,11 +133,11 @@ export async function computeAndSave(matchId: string, scorecard: unknown[]): Pro
     const fantasyPoints = Math.round(pts.total * 10) / 10
 
     if (dbIds.has(playerId)) {
-      directUpdates.push({ id: playerId, points: fantasyPoints })
+      directUpdates.push({ id: playerId, points: fantasyPoints, breakdown: pts.components })
     } else {
       const matched = dbList.find((p: { id: string; name: string }) => namesMatch(pts.name, p.name))
       if (matched) {
-        idRemaps.push({ oldId: matched.id, newId: playerId, fantasyPoints })
+        idRemaps.push({ oldId: matched.id, newId: playerId, fantasyPoints, breakdown: pts.components })
       } else {
         // Truly unknown player (impact substitute not in original squad, e.g. Linde)
         // Auto-insert them so their points are tracked
@@ -138,48 +147,91 @@ export async function computeAndSave(matchId: string, scorecard: unknown[]): Pro
           team: teamMap.get(playerId) || "",
           role: inferRole(pts),
           fantasy_points: fantasyPoints,
+          breakdown: pts.components,
         })
         autoInsertNames.push(pts.name)
       }
     }
   }
 
-  // Parallel direct updates
+  // Track whether the points_breakdown column is present.  Optimistic: assume
+  // present until a write fails with a column-missing error, at which point
+  // we flip to false and skip the field on all remaining writes.  This keeps
+  // live scoring functional even if the migration hasn't been applied.
+  let pointsBreakdownAvailable = true
+
+  // Parallel direct updates.  Each one tries with points_breakdown; on
+  // column-missing it retries without and flips the global flag.
   const directResults = await Promise.all(
-    directUpdates.map(({ id, points }) =>
-      supabaseAdmin
+    directUpdates.map(async ({ id, points, breakdown }) => {
+      const payload: Record<string, unknown> = { fantasy_points: points, last_updated: now }
+      if (pointsBreakdownAvailable) payload.points_breakdown = breakdown
+      const r = await supabaseAdmin
         .from("match_players")
-        .update({ fantasy_points: points, last_updated: now })
+        .update(payload)
         .eq("match_id", matchId)
         .eq("cricketdata_player_id", id)
-    )
+      if (r.error && isPointsBreakdownColumnMissing(r.error.message)) {
+        pointsBreakdownAvailable = false
+        return supabaseAdmin
+          .from("match_players")
+          .update({ fantasy_points: points, last_updated: now })
+          .eq("match_id", matchId)
+          .eq("cricketdata_player_id", id)
+      }
+      return r
+    }),
   )
   const updated = directResults.filter((r: { error: unknown }) => !r.error).length
 
-  // Name-based remaps: correct stored ID and save points.
+  // Name-based remaps: correct stored ID and save points + breakdown.
   // Deduplicate by oldId first — an all-rounder can appear twice in pointsMap
   // (once as batsman cb_ID_A, once as bowler cb_ID_B) but both name-match the
   // same DB row whose current ID is oldId.  The first remap changes the DB row's
   // cricketdata_player_id to cb_ID_A; the second then finds no row with oldId and
   // the bowling points are silently lost.  Fix: merge all remaps for the same
-  // oldId into a single update with summed fantasy points.
-  const mergedRemaps = new Map<string, { oldId: string; newId: string; fantasyPoints: number }>()
+  // oldId into a single update with summed fantasy points AND concatenated
+  // breakdown components.
+  const mergedRemaps = new Map<string, { oldId: string; newId: string; fantasyPoints: number; breakdown: BreakdownComponent[] }>()
   for (const remap of idRemaps) {
     if (mergedRemaps.has(remap.oldId)) {
-      mergedRemaps.get(remap.oldId)!.fantasyPoints += remap.fantasyPoints
+      const existing = mergedRemaps.get(remap.oldId)!
+      existing.fantasyPoints += remap.fantasyPoints
+      existing.breakdown = [...existing.breakdown, ...remap.breakdown]
     } else {
-      mergedRemaps.set(remap.oldId, { ...remap })
+      mergedRemaps.set(remap.oldId, { ...remap, breakdown: [...remap.breakdown] })
     }
   }
 
   let remapped = 0
-  for (const { oldId, newId, fantasyPoints } of mergedRemaps.values()) {
-    const { error } = await supabaseAdmin
+  for (const { oldId, newId, fantasyPoints, breakdown } of mergedRemaps.values()) {
+    const payload: Record<string, unknown> = {
+      cricketdata_player_id: newId,
+      fantasy_points: fantasyPoints,
+      last_updated: now,
+    }
+    if (pointsBreakdownAvailable) payload.points_breakdown = breakdown
+    const r = await supabaseAdmin
       .from("match_players")
-      .update({ cricketdata_player_id: newId, fantasy_points: fantasyPoints, last_updated: now })
+      .update(payload)
       .eq("match_id", matchId)
       .eq("cricketdata_player_id", oldId)
-    if (!error) remapped++
+    if (r.error && isPointsBreakdownColumnMissing(r.error.message)) {
+      pointsBreakdownAvailable = false
+      const retryPayload: Record<string, unknown> = {
+        cricketdata_player_id: newId,
+        fantasy_points: fantasyPoints,
+        last_updated: now,
+      }
+      const retry = await supabaseAdmin
+        .from("match_players")
+        .update(retryPayload)
+        .eq("match_id", matchId)
+        .eq("cricketdata_player_id", oldId)
+      if (!retry.error) remapped++
+    } else if (!r.error) {
+      remapped++
+    }
   }
 
   // Also fix up the idRemaps array so the team-repair loop below uses the merged list
@@ -226,33 +278,44 @@ export async function computeAndSave(matchId: string, scorecard: unknown[]): Pro
   let autoAdded = 0
   const missed: string[] = []
   if (autoInsertPlayers.length > 0) {
-    const rows = autoInsertPlayers.map(p => ({
-      match_id: matchId,
-      cricketdata_player_id: p.cricketdata_player_id,
-      name: p.name,
-      team: p.team,
-      role: p.role,
-      is_playing: true,
-      is_substitute: true,
-      fantasy_points: p.fantasy_points,
-      last_updated: now,
-    }))
-    const { error } = await supabaseAdmin.from("match_players").insert(rows)
-    if (!error) {
+    const buildRows = (includeBreakdown: boolean, includeSub: boolean) =>
+      autoInsertPlayers.map(p => {
+        const row: Record<string, unknown> = {
+          match_id: matchId,
+          cricketdata_player_id: p.cricketdata_player_id,
+          name: p.name,
+          team: p.team,
+          role: p.role,
+          is_playing: true,
+          fantasy_points: p.fantasy_points,
+          last_updated: now,
+        }
+        if (includeSub) row.is_substitute = true
+        if (includeBreakdown) row.points_breakdown = p.breakdown
+        return row
+      })
+
+    let rows = buildRows(pointsBreakdownAvailable, true)
+    let r = await supabaseAdmin.from("match_players").insert(rows)
+    // Retry without points_breakdown if that column is missing.
+    if (r.error && isPointsBreakdownColumnMissing(r.error.message)) {
+      pointsBreakdownAvailable = false
+      rows = buildRows(false, true)
+      r = await supabaseAdmin.from("match_players").insert(rows)
+    }
+    // Retry without is_substitute if THAT column is missing (legacy schema).
+    if (r.error) {
+      const msg = r.error.message || ""
+      const subMissing = /is_substitute/i.test(msg) && /column|does not exist|schema cache/i.test(msg)
+      if (subMissing) {
+        rows = buildRows(pointsBreakdownAvailable, false)
+        r = await supabaseAdmin.from("match_players").insert(rows)
+      }
+    }
+    if (!r.error) {
       autoAdded = autoInsertPlayers.length
     } else {
-      const msg = error.message || ""
-      const looksLikeMissingColumn =
-        /is_substitute/i.test(msg) && /column|does not exist|schema cache/i.test(msg)
-      if (looksLikeMissingColumn) {
-        // eslint-disable-next-line @typescript-eslint/no-unused-vars
-        const stripped = rows.map(({ is_substitute, ...rest }) => rest)
-        const { error: retryErr } = await supabaseAdmin.from("match_players").insert(stripped)
-        if (!retryErr) autoAdded = autoInsertPlayers.length
-        else missed.push(...autoInsertNames)
-      } else {
-        missed.push(...autoInsertNames)
-      }
+      missed.push(...autoInsertNames)
     }
   }
 
