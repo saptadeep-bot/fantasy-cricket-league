@@ -68,24 +68,49 @@ function inferRole(pts: { batting: number; bowling: number }): string {
 // Calculates fantasy points from scorecard and persists to DB.
 // Handles: direct ID match, name-fuzzy match (ID remap), auto-insert of unknown players.
 export async function computeAndSave(matchId: string, scorecard: unknown[]): Promise<ComputeResult> {
-  const pointsMap = calculateFantasyPoints(scorecard)
+  // Fetch match metadata (scheduled_at — drives SR rule selection) and the
+  // squad (id + name + role — drives ID/name match AND specialist-bowler
+  // exemption for the new SR rules).  Done up front, in parallel, so the
+  // calculator has everything it needs on the first pass.
+  const [matchRes, playersRes] = await Promise.all([
+    supabaseAdmin.from("matches").select("scheduled_at").eq("id", matchId).single(),
+    supabaseAdmin.from("match_players")
+      .select("cricketdata_player_id, name, role")
+      .eq("match_id", matchId),
+  ])
+
+  const matchDate = matchRes.data?.scheduled_at ?? null
+  const dbList: Array<{ id: string; name: string; role?: string }> = (playersRes.data || []).map(
+    (p: { cricketdata_player_id: string; name: string; role?: string }) => ({
+      id: p.cricketdata_player_id,
+      name: p.name,
+      role: p.role,
+    }),
+  )
+  const dbIds = new Set(dbList.map(p => p.id))
+  const roleById = new Map<string, string>()
+  for (const p of dbList) {
+    if (p.role) roleById.set(p.id, p.role)
+  }
+
+  // Role lookup for the calculator.  Tries direct ID first; if the scorecard
+  // ID hasn't been remapped yet (different from what's in match_players),
+  // falls back to fuzzy name match.  This handles the live-poll edge case
+  // where cricapi's IDs drift but our squad is named correctly.
+  const getRole = (id: string, name: string): "BAT" | "BOWL" | "ALL" | "WK" | undefined => {
+    const direct = roleById.get(id)
+    if (direct) return direct as "BAT" | "BOWL" | "ALL" | "WK"
+    const matched = dbList.find(p => namesMatch(name, p.name))
+    return matched?.role as "BAT" | "BOWL" | "ALL" | "WK" | undefined
+  }
+
+  const pointsMap = calculateFantasyPoints(scorecard, { matchDate, getRole })
   if (pointsMap.size === 0) {
     return { updated: 0, total: 0, remapped: 0, autoAdded: 0, missed: [] }
   }
 
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   const teamMap = playerTeamsFromScorecard(scorecard as any[])
-
-  const { data: dbPlayers } = await supabaseAdmin
-    .from("match_players")
-    .select("cricketdata_player_id, name")
-    .eq("match_id", matchId)
-
-  const dbList = (dbPlayers || []).map((p: { cricketdata_player_id: string; name: string }) => ({
-    id: p.cricketdata_player_id,
-    name: p.name,
-  }))
-  const dbIds = new Set(dbList.map((p: { id: string }) => p.id))
 
   const now = new Date().toISOString()
   const directUpdates: Array<{ id: string; points: number }> = []

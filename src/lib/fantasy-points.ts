@@ -12,7 +12,50 @@ export interface PlayerFantasyPoints {
   total: number
 }
 
-function calcBattingPoints(r: number, b: number, fours: number, sixes: number, dismissal: string): number {
+export type PlayerRole = "BAT" | "BOWL" | "ALL" | "WK"
+
+export interface CalcOptions {
+  /**
+   * Match's scheduled_at.  Drives strike-rate rule selection: matches on or
+   * after `SR_RULES_NEW_FROM` use the 2026-04-28 ruleset (different floor
+   * thresholds and specialist-bowler exemption); earlier matches use the
+   * legacy ruleset so re-finalising an old match doesn't retroactively
+   * change its scores.  Default: today (i.e. new rules).
+   */
+  matchDate?: string | Date | null
+  /**
+   * Look up a player's role by their scorecard ID + name.  The role is used
+   * to skip the strike-rate adjustment for specialist bowlers (BOWL only —
+   * all-rounders/ALL still get judged on SR because they bat regularly).
+   * If undefined or returns undefined for a player, SR is applied as if
+   * they were a batter (safe default — known bowlers in the squad are
+   * caught by the lookup, unknown auto-inserts get treated like batters
+   * until the next squad fetch corrects their role).
+   */
+  getRole?: (id: string, name: string) => PlayerRole | undefined
+}
+
+// 2026-04-28: switched to the new SR ruleset.  Matches scheduled before
+// this date keep the legacy thresholds so re-finalising an old match
+// doesn't change its historical scores.
+export const SR_RULES_NEW_FROM = new Date("2026-04-28T00:00:00Z")
+
+function shouldUseNewSrRules(matchDate?: string | Date | null): boolean {
+  if (!matchDate) return true   // safe default — current/future matches
+  const d = typeof matchDate === "string" ? new Date(matchDate) : matchDate
+  if (isNaN(d.getTime())) return true
+  return d.getTime() >= SR_RULES_NEW_FROM.getTime()
+}
+
+function calcBattingPoints(
+  r: number,
+  b: number,
+  fours: number,
+  sixes: number,
+  dismissal: string,
+  useNewSrRules: boolean,
+  isSpecialistBowler: boolean,
+): number {
   let pts = 0
 
   pts += r           // 1 pt per run
@@ -28,15 +71,35 @@ function calcBattingPoints(r: number, b: number, fours: number, sixes: number, d
   const isOut = dismissal && !dismissal.toLowerCase().includes('not out') && dismissal.trim() !== ''
   if (r === 0 && isOut && b > 0) pts -= 2
 
-  // Strike rate bonus/penalty (min 10 balls faced)
-  if (b >= 10) {
+  // Strike rate bonus/penalty (min 10 balls faced).
+  //
+  // 2026-04-28 ruleset:
+  //   - Specialist bowlers (role === "BOWL") are exempt entirely.  They
+  //     aren't expected to bat at a healthy SR.  All-rounders (ALL) are
+  //     NOT exempt — they bat regularly.
+  //   - Bonus thresholds unchanged: ≥170 → +6, 150–170 → +4, 130–150 → +2.
+  //   - Penalty thresholds shifted: 60–70 → -2, 50–60 → -4, <50 → -6
+  //     (was <40 → -6, 40–60 → -4, 60–70 → -2).
+  //
+  // Legacy ruleset (matches before 2026-04-28) is preserved verbatim so
+  // re-finalise on historical matches doesn't move scores.
+  if (b >= 10 && !(useNewSrRules && isSpecialistBowler)) {
     const sr = (r / b) * 100
-    if      (sr >= 170) pts += 6
-    else if (sr >= 150) pts += 4
-    else if (sr >= 130) pts += 2
-    else if (sr < 40)   pts -= 6
-    else if (sr < 60)   pts -= 4
-    else if (sr < 70)   pts -= 2
+    if (useNewSrRules) {
+      if      (sr >= 170) pts += 6
+      else if (sr >= 150) pts += 4
+      else if (sr >= 130) pts += 2
+      else if (sr < 50)   pts -= 6
+      else if (sr < 60)   pts -= 4
+      else if (sr < 70)   pts -= 2
+    } else {
+      if      (sr >= 170) pts += 6
+      else if (sr >= 150) pts += 4
+      else if (sr >= 130) pts += 2
+      else if (sr < 40)   pts -= 6
+      else if (sr < 60)   pts -= 4
+      else if (sr < 70)   pts -= 2
+    }
   }
 
   return pts
@@ -92,8 +155,10 @@ function extractName(entry: Record<string, unknown>, nestedKey: string): string 
 }
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
-export function calculateFantasyPoints(scorecard: any[]): Map<string, PlayerFantasyPoints> {
+export function calculateFantasyPoints(scorecard: any[], options: CalcOptions = {}): Map<string, PlayerFantasyPoints> {
   const playerMap = new Map<string, PlayerFantasyPoints>()
+  const useNewSrRules = shouldUseNewSrRules(options.matchDate)
+  const getRole = options.getRole ?? (() => undefined)
 
   const getOrCreate = (id: string, name: string): PlayerFantasyPoints => {
     if (!playerMap.has(id)) {
@@ -118,12 +183,15 @@ export function calculateFantasyPoints(scorecard: any[]): Map<string, PlayerFant
       if (!id) continue
 
       const dismissalText = (entry['dismissal-text'] ?? entry.dismissal ?? '') as string
+      const role = getRole(id, name)
       const pts = calcBattingPoints(
         Number(entry.r ?? 0),
         Number(entry.b ?? 0),
         Number(entry['4s'] ?? 0),
         Number(entry['6s'] ?? 0),
-        dismissalText
+        dismissalText,
+        useNewSrRules,
+        role === "BOWL",
       )
       const p = getOrCreate(id, name)
       p.batting += pts
