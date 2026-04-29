@@ -464,5 +464,23 @@ export async function GET(req: NextRequest, { params }: { params: Promise<{ id: 
   }
 
   const [players, teams] = await Promise.all([readPlayersFromDb(id), readTeamsFromDb(id)])
+
+  // Diagnostic: top-3 player rows by fantasy_points so we can see at a glance
+  // whether the writes are landing with non-zero values.  When users report
+  // "all scores zero", this pins down whether the calculator is returning
+  // zeros (data issue) or whether the writes are being clobbered (write
+  // issue) — without needing them to run SQL in Supabase.
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const top3 = (players as any[])
+    .slice() // don't mutate the readPlayersFromDb result
+    .sort((a, b) => (b.fantasy_points ?? 0) - (a.fantasy_points ?? 0))
+    .slice(0, 3)
+    .map(p => `${p.name}:${p.fantasy_points ?? 0}`)
+    .join(", ")
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const nonZeroCount = (players as any[]).filter(p => (p.fantasy_points ?? 0) > 0).length
+  debug.top3 = top3
+  debug.nonZeroPlayers = `${nonZeroCount}/${players.length}`
+
   return NextResponse.json({ players, teams, _debug: debug }, { headers: NO_CACHE_HEADERS })
 }

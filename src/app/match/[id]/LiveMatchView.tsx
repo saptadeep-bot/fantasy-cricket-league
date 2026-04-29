@@ -251,6 +251,11 @@ export default function LiveMatchView({
         } else {
           parts.push("no_fetch")
         }
+        // 2026-04-28 diagnostic: show non-zero player count + top-3 sample so
+        // "all scores zero" reports are immediately distinguishable from
+        // "early-match, only openers have points yet".
+        if (typeof d.nonZeroPlayers === "string") parts.push(`nonzero:${d.nonZeroPlayers}`)
+        if (typeof d.top3 === "string" && d.top3) parts.push(`top3:${d.top3}`)
         setDebugInfo(parts.join(" | "))
       }
     } catch {
