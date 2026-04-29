@@ -28,6 +28,7 @@
 import { auth } from "@/auth"
 import { supabaseAdmin } from "@/lib/supabase"
 import { fetchEntitySportSquadDetailed, type EntitySportSquadPlayer } from "@/lib/scorecard-sources"
+import { canonicalTeam, sameTeam } from "@/lib/team-names"
 import { NextRequest, NextResponse } from "next/server"
 
 const CRICKETDATA_API_KEY = process.env.CRICKETDATA_API_KEY!
@@ -44,10 +45,13 @@ function mapRole(role: string): Role {
   return "BAT"
 }
 
-// Normalise a player name for cross-source matching.  EntitySport often uses
+// Normalise a PLAYER name for cross-source matching.  EntitySport often uses
 // full names ("Abhishek Sharma"), cricapi uses shortened ("A Sharma").  We
 // normalise to lowercase + strip punctuation + collapse whitespace, and then
 // also compute a compact "initial + last name" form.
+//
+// Note: TEAM-name normalisation lives in `@/lib/team-names` (shared with the
+// live-scoring path).  This local `normaliseName` is for player names only.
 function normaliseName(name: string): string {
   return name.toLowerCase().replace(/[^a-z\s]/g, "").replace(/\s+/g, " ").trim()
 }
@@ -118,68 +122,10 @@ interface MergedPlayer {
   is_playing_hint: boolean     // from EntitySport's `playing11:"true"`
 }
 
-// Cross-source team-name matching.  Cricapi returns full names ("Royal
-// Challengers Bengaluru"); EntitySport often returns either full names OR
-// short-codes ("RCB").  The old equality/substring check failed the short-
-// code case entirely, which meant EntitySport-only players got bucketed
-// under their short-code team label instead of being merged with the
-// cricapi player under the full team name.
-//
-// Curated alias map covers every IPL team's known variants.  Falls back to
-// the generic acronym/substring match so non-IPL fixtures (warm-ups, rare
-// tournaments) still work.
-const TEAM_ALIASES: Record<string, string[]> = {
-  "royal challengers bengaluru": ["rcb", "royal challengers bangalore", "bengaluru", "bangalore"],
-  "royal challengers bangalore": ["rcb", "royal challengers bengaluru", "bengaluru", "bangalore"],
-  "chennai super kings": ["csk", "chennai"],
-  "mumbai indians": ["mi", "mumbai"],
-  "kolkata knight riders": ["kkr", "kolkata"],
-  "sunrisers hyderabad": ["srh", "hyderabad"],
-  "delhi capitals": ["dc", "delhi"],
-  "punjab kings": ["pbks", "punjab", "kings xi punjab", "kxip"],
-  "rajasthan royals": ["rr", "rajasthan"],
-  "lucknow super giants": ["lsg", "lucknow"],
-  "gujarat titans": ["gt", "gujarat"],
-}
-
-function acronymOf(name: string): string {
-  const parts = normaliseName(name).split(" ").filter(Boolean)
-  if (parts.length < 2) return ""
-  return parts.map(p => p[0]).join("")
-}
-
-function sameTeam(a: string, b: string): boolean {
-  const na = normaliseName(a), nb = normaliseName(b)
-  if (!na || !nb) return false
-  if (na === nb) return true
-  // Curated alias lookup — handles "LSG" ↔ "Lucknow Super Giants" etc.
-  const aliasA = TEAM_ALIASES[na] ?? []
-  if (aliasA.includes(nb)) return true
-  const aliasB = TEAM_ALIASES[nb] ?? []
-  if (aliasB.includes(na)) return true
-  // Cross-match if they share any alias (e.g. both aliases of the same team)
-  if (aliasA.some(x => aliasB.includes(x))) return true
-  // Generic acronym match: "lsg" vs "lucknow super giants"
-  if (acronymOf(na) === nb || acronymOf(nb) === na) return true
-  // Fallback: substring containment (original behaviour)
-  return na.includes(nb) || nb.includes(na)
-}
-
-// Canonicalise a team name returned by cricapi/EntitySport against the
-// match's actual team1/team2.  Returns the canonical DB string if there's
-// a match, or null if the API gave us a rogue team (e.g. cricapi's pre-
-// toss squad endpoint occasionally returns the wrong team — we saw it
-// return Lahore Qalandars for an MI vs SRH fixture days before the toss).
-//
-// Returning null lets the caller filter out players belonging to a team
-// that has nothing to do with this match, instead of inserting them and
-// letting users draft fictional squads.
-function canonicalTeam(apiTeamName: string, t1: string, t2: string): string | null {
-  if (!apiTeamName) return null
-  if (sameTeam(apiTeamName, t1)) return t1
-  if (sameTeam(apiTeamName, t2)) return t2
-  return null
-}
+// Team-name matching now lives in `@/lib/team-names` — shared with the live-
+// scoring and finalize paths so a wrong-fixture API response can't leak
+// PAK/NZ players into an IPL match (2026-04-28 incident).  See that file
+// for the alias map and `sameTeam` / `canonicalTeam` semantics.
 
 function mergeSquads(
   cricapiPlayers: CricapiSquadPlayer[],

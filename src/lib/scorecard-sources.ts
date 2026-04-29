@@ -31,6 +31,8 @@
  * data, we skip it.
  */
 
+import { canonicalTeam } from "@/lib/team-names"
+
 const CRICKETDATA_API_KEY = process.env.CRICKETDATA_API_KEY!
 const CRICBUZZ_API_KEY = process.env.CRICBUZZ_API_KEY // same key covers EntitySport host
 
@@ -364,6 +366,29 @@ export async function fetchEntitySportScorecardDetailed(
     const innings = infoData?.response?.scorecard?.innings
     if (!Array.isArray(innings) || innings.length === 0) {
       return { scorecard: null, reason: `matched_${esMatchId}_no_innings`, resolvedEsMatchId: esMatchId }
+    }
+
+    // Team-name validation — defends against EntitySport's listing returning
+    // a wrong-fixture match (e.g. Pakistan/NZ scorecard data leaking into an
+    // IPL match's match_players, 2026-04-28 incident).
+    //
+    // Walk innings[].name (or .teama / .teamb labels), canonicalise each to
+    // match.team1 / match.team2.  If we find an innings whose team is rogue,
+    // refuse the data AND invalidate the cache so the next poll re-resolves.
+    // Better to return null and fall through to other sources than to write
+    // someone else's match's points into the DB.
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const inningsTeams = (innings as any[])
+      .map(inn => (inn?.name ?? inn?.short_name ?? "").toString())
+      .filter(Boolean)
+    const rogue = inningsTeams.find(t => !canonicalTeam(t, team1, team2))
+    if (rogue) {
+      return {
+        scorecard: null,
+        reason: `matched_${esMatchId}_rogue_innings:${rogue.slice(0, 40)}`,
+        // Invalidate the cache so the next call re-resolves from listings.
+        resolvedEsMatchId: null,
+      }
     }
 
     const converted = convertEntitySportScorecard(innings)

@@ -322,6 +322,22 @@ async function fetchAndSaveScores(matchId: string, cricketdataMatchId: string): 
   if (scorecard) {
     const scorecardResult = await computeAndSave(matchId, scorecard)
     lastDetail += ` | computeAndSave: ${scorecardResult.updated}/${scorecardResult.total}`
+    // Surface the rogue-scorecard refusal so admin can see why writes
+    // stopped — and on the live path, also invalidate the cached match IDs
+    // so the next poll re-resolves from listings instead of replaying the
+    // wrong fixture data.
+    if (scorecardResult.rejectedReason) {
+      lastDetail += ` | REJECTED: ${scorecardResult.rejectedReason}`
+      try {
+        await supabaseAdmin
+          .from("matches")
+          .update({ entitysport_match_id: null, cricbuzz_match_id: null })
+          .eq("id", matchId)
+        lastDetail += ` | cleared cached match IDs`
+      } catch {
+        // best effort — don't fail the request
+      }
+    }
     return { ...scorecardResult, source, lastDetail }
   }
 

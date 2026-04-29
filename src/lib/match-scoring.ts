@@ -1,6 +1,7 @@
 // src/lib/match-scoring.ts
 import { supabaseAdmin } from "@/lib/supabase"
 import { calculateFantasyPoints, type BreakdownComponent } from "@/lib/fantasy-points"
+import { canonicalTeam, teamFromInningLabel } from "@/lib/team-names"
 
 export interface ComputeResult {
   updated: number
@@ -8,6 +9,12 @@ export interface ComputeResult {
   remapped: number
   autoAdded: number
   missed: string[]
+  // Set when the scorecard's team labels don't canonicalise to match.team1/
+  // team2.  We refuse to write — protects against PAK/NZ players' points
+  // landing in an IPL match's match_players (2026-04-28 incident, root cause
+  // was EntitySport's listing returning a wrong-fixture match_id which got
+  // cached and replayed every poll).
+  rejectedReason?: string
 }
 
 // Detect a Postgrest "points_breakdown column doesn't exist" error so writes
@@ -77,18 +84,44 @@ function inferRole(pts: { batting: number; bowling: number }): string {
 // Calculates fantasy points from scorecard and persists to DB.
 // Handles: direct ID match, name-fuzzy match (ID remap), auto-insert of unknown players.
 export async function computeAndSave(matchId: string, scorecard: unknown[]): Promise<ComputeResult> {
-  // Fetch match metadata (scheduled_at — drives SR rule selection) and the
-  // squad (id + name + role — drives ID/name match AND specialist-bowler
-  // exemption for the new SR rules).  Done up front, in parallel, so the
-  // calculator has everything it needs on the first pass.
+  // Fetch match metadata (scheduled_at — drives SR rule selection; team1/
+  // team2 — drives team validation) and the squad (id + name + role — drives
+  // ID/name match AND specialist-bowler exemption for the new SR rules).
+  // Done up front, in parallel, so the calculator has everything it needs
+  // on the first pass.
   const [matchRes, playersRes] = await Promise.all([
-    supabaseAdmin.from("matches").select("scheduled_at").eq("id", matchId).single(),
+    supabaseAdmin.from("matches").select("scheduled_at, team1, team2").eq("id", matchId).single(),
     supabaseAdmin.from("match_players")
       .select("cricketdata_player_id, name, role")
       .eq("match_id", matchId),
   ])
 
   const matchDate = matchRes.data?.scheduled_at ?? null
+  const matchTeam1 = (matchRes.data?.team1 ?? "") as string
+  const matchTeam2 = (matchRes.data?.team2 ?? "") as string
+
+  // Team-name guard: refuse to compute if the scorecard's innings don't
+  // belong to this match.  Defends against EntitySport returning a wrong-
+  // fixture scorecard via a stale cached match_id (the 2026-04-28 incident
+  // where PAK/NZ players' points landed in MI vs SRH).  Without this guard,
+  // the auto-insert path would happily add foreign players to match_players.
+  if (matchTeam1 && matchTeam2) {
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const inningTeams = (scorecard as any[])
+      .map(inn => teamFromInningLabel((inn?.inning ?? "").toString()))
+      .filter(Boolean)
+    const rogue = inningTeams.find(t => !canonicalTeam(t, matchTeam1, matchTeam2))
+    if (rogue) {
+      return {
+        updated: 0,
+        total: 0,
+        remapped: 0,
+        autoAdded: 0,
+        missed: [],
+        rejectedReason: `scorecard innings team "${rogue}" doesn't match ${matchTeam1} or ${matchTeam2} — refusing to write`,
+      }
+    }
+  }
   const dbList: Array<{ id: string; name: string; role?: string }> = (playersRes.data || []).map(
     (p: { cricketdata_player_id: string; name: string; role?: string }) => ({
       id: p.cricketdata_player_id,
@@ -139,12 +172,26 @@ export async function computeAndSave(matchId: string, scorecard: unknown[]): Pro
       if (matched) {
         idRemaps.push({ oldId: matched.id, newId: playerId, fantasyPoints, breakdown: pts.components })
       } else {
-        // Truly unknown player (impact substitute not in original squad, e.g. Linde)
-        // Auto-insert them so their points are tracked
+        // Truly unknown player — could be a legitimate impact sub (e.g. Linde
+        // for LSG) OR a foreign player from a wrong-fixture scorecard (e.g.
+        // Babar Azam in an IPL match because EntitySport's listing mapped to
+        // a PAK match).  Defence in depth: only auto-insert if the player's
+        // team from the scorecard canonicalises to match.team1/team2.  The
+        // outer guard at the top of computeAndSave should already have
+        // refused on rogue innings, but if a single innings somehow has
+        // mixed teams or the team label was empty we catch it here too.
+        const playerTeamRaw = teamMap.get(playerId) || ""
+        const canonTeam = matchTeam1 && matchTeam2
+          ? canonicalTeam(playerTeamRaw, matchTeam1, matchTeam2)
+          : playerTeamRaw  // older codepath — no guard
+        if (matchTeam1 && matchTeam2 && !canonTeam) {
+          // Drop silently — don't pollute match_players with foreign squads.
+          continue
+        }
         autoInsertPlayers.push({
           cricketdata_player_id: playerId,
           name: pts.name,
-          team: teamMap.get(playerId) || "",
+          team: canonTeam || playerTeamRaw,
           role: inferRole(pts),
           fantasy_points: fantasyPoints,
           breakdown: pts.components,
