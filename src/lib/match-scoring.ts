@@ -39,20 +39,57 @@ export function namesMatch(a: string, b: string): boolean {
   const pa = na.split(" ")
   const pb = nb.split(" ")
 
-  // Surname (last word) must match
+  // Surname (last word) must match.  Without this anchor we'd false-match
+  // any two players sharing a first name.
   if (pa[pa.length - 1] !== pb[pb.length - 1]) return false
 
-  const fa = pa[0]
-  const fb = pb[0]
+  // Pre-surname words — everything except the last token.
+  const preA = pa.slice(0, -1)
+  const preB = pb.slice(0, -1)
+
+  // Edge: both are single-word names (just a surname).  Surname-equal already
+  // confirmed → match.
+  if (preA.length === 0 && preB.length === 0) return true
+  // One has only a surname, the other has more — too ambiguous, refuse.
+  if (preA.length === 0 || preB.length === 0) return false
+
+  const fa = preA[0]
+  const fb = preB[0]
   if (fa === fb) return true
 
-  // Single initial: "v" matches "virat"
+  // 2026-04-30: joined-vs-split first name handling.  EntitySport returns
+  // "Surya Kumar Yadav" while cricapi returns "Suryakumar Yadav".  The old
+  // logic compared just the FIRST word of each (`surya` vs `suryakumar`)
+  // and rejected the match — live polling then auto-inserted an orphan row
+  // and the picked row stayed at 0.  Same root cause for the SKY/Tilak
+  // mis-scoring on 2026-04-29.  Fix: concatenate every pre-surname word and
+  // compare — the joined forms are identical for these cases.
+  const joinedA = preA.join("")
+  const joinedB = preB.join("")
+  if (joinedA === joinedB) return true
+
+  // Single initial: "v" matches "virat".  (Only meaningful when ONE side is
+  // a 1-char initial; otherwise 'v' would match every v-name.)
   if (fa.length === 1 && fb.startsWith(fa)) return true
   if (fb.length === 1 && fa.startsWith(fb)) return true
 
-  // Double/triple initials: "ms" → first letter matches
+  // Double/triple initials: "ms" → first letter matches "mahendra"
   if (fa.length <= 3 && fb.length > 3 && fa[0] === fb[0]) return true
   if (fb.length <= 3 && fa.length > 3 && fb[0] === fa[0]) return true
+
+  // 2026-04-30: extra-leading-initial handling.  EntitySport sometimes
+  // returns "N. Tilak Varma" where cricapi has "Tilak Varma" — the "N." is
+  // an additional initial that shifts every subsequent token.  Surname and
+  // middle name still match, just the leading initial throws everything off.
+  // Fix: if every pre-surname word longer than 1 char from one side appears
+  // in the other side's pre-surname words, treat as a match.  The length>1
+  // filter prevents a stray initial token from being the only "evidence".
+  const sigA = preA.filter(w => w.length > 1)
+  const sigB = preB.filter(w => w.length > 1)
+  const setA = new Set(preA)
+  const setB = new Set(preB)
+  if (sigA.length > 0 && sigA.every(w => setB.has(w))) return true
+  if (sigB.length > 0 && sigB.every(w => setA.has(w))) return true
 
   return false
 }
