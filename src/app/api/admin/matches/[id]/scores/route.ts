@@ -338,6 +338,13 @@ async function fetchAndSaveScores(matchId: string, cricketdataMatchId: string): 
         // best effort — don't fail the request
       }
     }
+    // Silent-drop diagnostic — when the auto-insert team-guard refuses a
+    // player (foreign team or unmappable), surface their names here.  Empty
+    // in the happy case.  Critical for diagnosing "X's points aren't
+    // updating" reports without manually digging through DB.
+    if (scorecardResult.dropped && scorecardResult.dropped.length > 0) {
+      lastDetail += ` | dropped:${scorecardResult.dropped.slice(0, 5).join(",")}`
+    }
     return { ...scorecardResult, source, lastDetail }
   }
 

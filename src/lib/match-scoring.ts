@@ -9,6 +9,11 @@ export interface ComputeResult {
   remapped: number
   autoAdded: number
   missed: string[]
+  // Players the auto-insert team-guard refused (no canonical team in the
+  // scorecard).  Empty in the happy case.  Surfaces in the live debug
+  // string so silent drops are visible — added 2026-05-05 after the Ngidi
+  // incident where this guard was over-rejecting legitimate bowlers.
+  dropped: string[]
   // Set when the scorecard's team labels don't canonicalise to match.team1/
   // team2.  We refuse to write — protects against PAK/NZ players' points
   // landing in an IPL match's match_players (2026-04-28 incident, root cause
@@ -77,6 +82,19 @@ export function namesMatch(a: string, b: string): boolean {
   if (fa.length <= 3 && fb.length > 3 && fa[0] === fb[0]) return true
   if (fb.length <= 3 && fa.length > 3 && fb[0] === fa[0]) return true
 
+  // 2026-05-05: short-name vs full-name handling.  EntitySport sometimes
+  // returns the player's full given name while cricapi uses the common /
+  // short name — e.g. "Lungisani Ngidi" vs "Lungi Ngidi", or "Suryakumar
+  // Yadav" vs "Surya Yadav" (when the middle "Kumar" is omitted).  The
+  // joined-form check above already handles the case where the middle word
+  // is split out vs joined; this prefix check handles the case where one
+  // form is a strict prefix of the other.  Conservative 4-char floor on
+  // the SHORTER name keeps "Tom" from matching "Tomato" / etc.  Also
+  // requires the match to be strict prefix from char 0 — surnames already
+  // matched, so combined likelihood of false positive is very low.
+  if (fa.length >= 4 && fb.length > fa.length && fb.startsWith(fa)) return true
+  if (fb.length >= 4 && fa.length > fb.length && fa.startsWith(fb)) return true
+
   // 2026-04-30: extra-leading-initial handling.  EntitySport sometimes
   // returns "N. Tilak Varma" where cricapi has "Tilak Varma" — the "N." is
   // an additional initial that shifts every subsequent token.  Surname and
@@ -95,16 +113,52 @@ export function namesMatch(a: string, b: string): boolean {
 }
 
 // ─── Extract player→team from scorecard innings ───────────────────────────────
+// Maps each player ID seen in the scorecard to the team they belong to.
+// Used by the auto-insert path's team-validation guard (added 2026-04-28 to
+// prevent cross-fixture leaks).  Originally only mapped batters — but bowlers
+// are from the OPPOSING team in each innings, and leaving them unmapped
+// caused legitimate bowlers (e.g. Lungi Ngidi for DC bowling vs CSK on
+// 2026-05-05) to be silently dropped by the team-guard whenever their name
+// didn't exact-match the squad-fetch row.  Now also maps bowlers, deriving
+// their team as "the configured team that ISN'T the batting team for this
+// innings".
+//
+// matchTeam1/team2 are optional — when unknown, we map bowlers to the raw
+// batting-team label which preserves legacy behaviour.  When known, we use
+// them to canonicalise the batting team and assign the opposing team to
+// every bowler in that innings.
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
-function playerTeamsFromScorecard(scorecard: any[]): Map<string, string> {
+function playerTeamsFromScorecard(
+  scorecard: any[],
+  matchTeam1?: string,
+  matchTeam2?: string,
+): Map<string, string> {
   const map = new Map<string, string>()
   for (const inning of scorecard) {
     const inningStr = typeof inning.inning === "string" ? inning.inning : ""
     // "Mumbai Indians Inning 1" → "Mumbai Indians"
-    const battingTeam = inningStr.replace(/\s+(Inning|Innings)\s+\d+$/i, "").trim()
+    const battingTeamRaw = inningStr.replace(/\s+(Inning|Innings)\s+\d+$/i, "").trim()
+
+    // Canonicalise the batting team name to match.team1/team2 if known.  If
+    // it doesn't canonicalise, fall back to the raw label (older code path).
+    const battingTeamCanon = (matchTeam1 && matchTeam2)
+      ? canonicalTeam(battingTeamRaw, matchTeam1, matchTeam2)
+      : null
+    const battingTeam = battingTeamCanon ?? battingTeamRaw
+
+    // Bowling team = the OTHER configured team.  Only meaningful when both
+    // configured teams are known AND batting team canonicalised cleanly.
+    const bowlingTeam = (battingTeamCanon && matchTeam1 && matchTeam2)
+      ? (battingTeamCanon === matchTeam1 ? matchTeam2 : matchTeam1)
+      : ""
+
     for (const entry of inning.batting || []) {
       const id = (entry.id ?? entry.batsman?.id ?? "") as string
       if (id && !map.has(id)) map.set(id, battingTeam)
+    }
+    for (const entry of inning.bowling || []) {
+      const id = (entry.id ?? entry.bowler?.id ?? "") as string
+      if (id && bowlingTeam && !map.has(id)) map.set(id, bowlingTeam)
     }
   }
   return map
@@ -155,6 +209,7 @@ export async function computeAndSave(matchId: string, scorecard: unknown[]): Pro
         remapped: 0,
         autoAdded: 0,
         missed: [],
+        dropped: [],
         rejectedReason: `scorecard innings team "${rogue}" doesn't match ${matchTeam1} or ${matchTeam2} — refusing to write`,
       }
     }
@@ -185,11 +240,15 @@ export async function computeAndSave(matchId: string, scorecard: unknown[]): Pro
 
   const pointsMap = calculateFantasyPoints(scorecard, { matchDate, getRole })
   if (pointsMap.size === 0) {
-    return { updated: 0, total: 0, remapped: 0, autoAdded: 0, missed: [] }
+    return { updated: 0, total: 0, remapped: 0, autoAdded: 0, missed: [], dropped: [] }
   }
 
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  const teamMap = playerTeamsFromScorecard(scorecard as any[])
+  const teamMap = playerTeamsFromScorecard(scorecard as any[], matchTeam1, matchTeam2)
+  // Track players the team-guard dropped (foreign or unmappable).  Surfaces
+  // in the response for live-debug visibility — silent drops were impossible
+  // to diagnose without this (Ngidi case, 2026-05-05).
+  const dropped: string[] = []
 
   const now = new Date().toISOString()
   const directUpdates: Array<{ id: string; points: number; breakdown: BreakdownComponent[] }> = []
@@ -222,7 +281,10 @@ export async function computeAndSave(matchId: string, scorecard: unknown[]): Pro
           ? canonicalTeam(playerTeamRaw, matchTeam1, matchTeam2)
           : playerTeamRaw  // older codepath — no guard
         if (matchTeam1 && matchTeam2 && !canonTeam) {
-          // Drop silently — don't pollute match_players with foreign squads.
+          // Drop — but record the name + raw team so live debug can surface
+          // it.  Silent drops were impossible to diagnose during the Ngidi
+          // incident (2026-05-05) until we added this list.
+          dropped.push(`${pts.name}[${playerTeamRaw || "no-team"}]`)
           continue
         }
         autoInsertPlayers.push({
@@ -403,5 +465,5 @@ export async function computeAndSave(matchId: string, scorecard: unknown[]): Pro
     }
   }
 
-  return { updated: updated + remapped, total: pointsMap.size, remapped, autoAdded, missed }
+  return { updated: updated + remapped, total: pointsMap.size, remapped, autoAdded, missed, dropped }
 }
