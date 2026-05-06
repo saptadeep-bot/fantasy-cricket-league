@@ -44,6 +44,22 @@ export function namesMatch(a: string, b: string): boolean {
   const pa = na.split(" ")
   const pb = nb.split(" ")
 
+  // 2026-05-06: surname-swap handling for South Indian naming conventions.
+  // Some sources render names as "<father's name> <given name>" and others
+  // as "<given name> <father's name>".  Same person, words in different
+  // order.  Examples:
+  //   "Vijaykumar Vyshak" ↔ "Vyshak Vijaykumar"   (PBKS bowler, 2026-05-06)
+  //   "Mahesh Theekshana" ↔ "Theekshana Mahesh"
+  // Multiset equality (sort + compare) is safe because it requires the
+  // EXACT same word tokens with no additions or omissions.  Two real
+  // cricketers having exactly the same set of name tokens but in different
+  // order is virtually unheard of at IPL level.
+  if (pa.length >= 2 && pa.length === pb.length) {
+    const sortedA = [...pa].sort().join(" ")
+    const sortedB = [...pb].sort().join(" ")
+    if (sortedA === sortedB) return true
+  }
+
   // Surname (last word) must match.  Without this anchor we'd false-match
   // any two players sharing a first name.
   if (pa[pa.length - 1] !== pb[pb.length - 1]) return false
