@@ -289,8 +289,12 @@ export default function LiveMatchView({
   useEffect(() => {
     if (match.status === "live") {
       fetchLiveScores()
-      // Poll every 60 seconds — server only calls API if data is stale
-      const interval = setInterval(fetchLiveScores, 60 * 1000)
+      // 2026-05-06: dropped from 60s → 30s for snappier UI updates.  The
+      // server-side cache in /api/admin/matches/[id]/scores gates external
+      // API calls at 25s, so 30s client polling deduplicates server-side:
+      // N concurrent viewers ≈ 1 external fetch per 25-30s window, same as
+      // before.  Quota burn unchanged.
+      const interval = setInterval(fetchLiveScores, 30 * 1000)
       return () => clearInterval(interval)
     }
   }, [match.status, fetchLiveScores])

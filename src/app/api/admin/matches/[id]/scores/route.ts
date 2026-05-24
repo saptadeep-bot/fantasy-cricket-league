@@ -393,6 +393,17 @@ export async function POST(req: NextRequest, { params }: { params: Promise<{ id:
 
   try {
     const result = await fetchAndSaveScores(id, match.cricketdata_match_id)
+    // Stamp the cache timestamp so the next 25s of auto-polls hit the cache
+    // instead of re-fetching from external APIs.  Admin POST DOES do an
+    // external fetch (that's its job), but it should also satisfy the
+    // server-side cache for nearby auto-polls.  Wrapped defensively so a
+    // missing column doesn't break the POST response.
+    try {
+      await supabaseAdmin
+        .from("matches")
+        .update({ last_live_fetch_at: new Date().toISOString() })
+        .eq("id", id)
+    } catch { /* column missing, ignore */ }
 
     if (result.liveInProgress) {
       const players = await readPlayersFromDb(id)
@@ -402,7 +413,7 @@ export async function POST(req: NextRequest, { params }: { params: Promise<{ id:
       return NextResponse.json({
         success: false,
         liveInProgress: true,
-        error: `Match is currently live — scores are refreshing automatically every 60 seconds. If points aren't showing yet, they'll appear shortly.${detailSuffix}`,
+        error: `Match is currently live — scores are refreshing automatically every 30 seconds. If points aren't showing yet, they'll appear shortly.${detailSuffix}`,
         lastDetail: result.lastDetail,
         players,
       }, { headers: NO_CACHE_HEADERS })
@@ -448,17 +459,36 @@ export async function GET(req: NextRequest, { params }: { params: Promise<{ id: 
     return NextResponse.json({ players, teams }, { headers: NO_CACHE_HEADERS })
   }
 
-  // Auto-poll: ALWAYS fetch from external APIs during live (no staleness
-  // throttle).  Previous behaviour was to skip the fetch when DB had been
-  // updated in the last 45s, but that caused lockouts during the 2026-04-20
-  // live match when admin POST kept `last_updated` warm while auto-poll
-  // silently returned the SAME snapshot over and over.  Client polls every
-  // 60s so load is bounded.
+  // Auto-poll: 30s client cadence with a SERVER-SIDE 25s gate (added
+  // 2026-05-06).  Faster UI updates than the old 60s blanket-poll while
+  // keeping external API hits down — multiple concurrent viewers dedupe
+  // at the server: only the first poll within each 25s window triggers
+  // an external fetch, the rest return cached DB data.
+  //
+  // Uses a DEDICATED column `matches.last_live_fetch_at`, NOT the per-row
+  // `match_players.last_updated`, because the latter is also touched by
+  // admin POST refreshes which would defeat the cache (the 2026-04-20
+  // frozen-scores bug).  Admin POST does its own external fetch and
+  // updates this timestamp too — see below.
+  //
+  // Defensive read with SELECT * — if the migration hasn't run yet, the
+  // column is undefined → cache age is Infinity → we fall back to the
+  // old "fetch every poll" behaviour, which is correct but slower.
   const { data: match } = await supabaseAdmin
     .from("matches")
-    .select("status, cricketdata_match_id")
+    .select("*")
     .eq("id", id)
     .single()
+
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const matchAny = (match ?? {}) as Record<string, any>
+  const lastLiveFetchAt = matchAny.last_live_fetch_at
+    ? new Date(matchAny.last_live_fetch_at as string)
+    : null
+  const externalFetchAgeMs = lastLiveFetchAt
+    ? Date.now() - lastLiveFetchAt.getTime()
+    : Number.POSITIVE_INFINITY
+  const CACHE_TTL_MS = 25_000
 
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   const debug: Record<string, any> = {
@@ -467,22 +497,42 @@ export async function GET(req: NextRequest, { params }: { params: Promise<{ id: 
     fetchAttempted: false,
     fetchResult: null,
     fetchError: null,
+    cacheAgeS: isFinite(externalFetchAgeMs) ? Math.floor(externalFetchAgeMs / 1000) : null,
   }
 
   if (match?.status === "live" && match?.cricketdata_match_id) {
-    debug.fetchAttempted = true
-    try {
-      const r = await fetchAndSaveScores(id, match.cricketdata_match_id)
-      debug.fetchResult = {
-        updated: r.updated,
-        total: r.total,
-        liveInProgress: r.liveInProgress ?? false,
-        notStarted: r.notStarted ?? false,
-        source: r.source ?? null,
+    if (externalFetchAgeMs < CACHE_TTL_MS) {
+      // Cache hit — skip external fetch.  Client still gets fresh DB read
+      // below, which contains whatever the most-recent external fetch wrote.
+      debug.fetchAttempted = false
+      debug.cacheHit = true
+    } else {
+      debug.fetchAttempted = true
+      try {
+        const r = await fetchAndSaveScores(id, match.cricketdata_match_id)
+        debug.fetchResult = {
+          updated: r.updated,
+          total: r.total,
+          liveInProgress: r.liveInProgress ?? false,
+          notStarted: r.notStarted ?? false,
+          source: r.source ?? null,
+        }
+        if (r.lastDetail) debug.lastDetail = r.lastDetail.slice(0, 500)
+        // Mark the fetch timestamp on the matches row so the next 25s of
+        // polls hit the cache.  Defensive try/catch — if the migration
+        // hasn't run yet, swallow the error and keep going.  Worst case:
+        // cache never engages and we behave like the old code did.
+        try {
+          await supabaseAdmin
+            .from("matches")
+            .update({ last_live_fetch_at: new Date().toISOString() })
+            .eq("id", id)
+        } catch {
+          /* column missing — migration not applied yet, just continue */
+        }
+      } catch (e) {
+        debug.fetchError = String(e).replace(/^Error:\s*/, "").slice(0, 400)
       }
-      if (r.lastDetail) debug.lastDetail = r.lastDetail.slice(0, 500)
-    } catch (e) {
-      debug.fetchError = String(e).replace(/^Error:\s*/, "").slice(0, 400)
     }
   }
 

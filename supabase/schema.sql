@@ -30,6 +30,7 @@ create table matches (
   base_prize int not null,
   rollover_added int default 0,
   result_announcement text,
+  last_live_fetch_at timestamptz,
   created_at timestamptz default now()
 );
 
