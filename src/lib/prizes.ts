@@ -7,16 +7,27 @@
  * 7+ players  → 1st: 50%, 2nd: 30%, 3rd: 20%
  */
 
+// Per-match entry fee (₹).  Single source of truth — every page that needs
+// to compute a prize pool or net balance pulls from here.  Older inline
+// copies in src/app/page.tsx, /match/[id]/page.tsx, /leaderboard, /ledger
+// MUST stay in sync with these tiers.
+//
+// 2026-05-06: bumped playoff and final tiers (was 350 / 500) to align with
+// what the friends agreed for the IPL 2026 playoffs:
+//   league             → ₹250  (unchanged)
+//   qualifier1 / 2     → ₹500
+//   eliminator         → ₹500
+//   final              → ₹1000
 export function getEntryFee(matchType: string): number {
   const type = (matchType || "league").toLowerCase()
-  if (type === "final") return 500
+  if (type === "final") return 1000
   if (
     type === "eliminator" ||
     type === "qualifier" ||
     type.includes("qualifier") ||
     type.includes("eliminator")
   )
-    return 350
+    return 500
   return 250 // league
 }
 

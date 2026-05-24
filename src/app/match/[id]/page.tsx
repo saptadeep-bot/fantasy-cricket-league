@@ -40,10 +40,12 @@ export default async function MatchPage({ params }: { params: Promise<{ id: stri
   const myTeam = teams?.find(t => t.user_id === session.user.id)
 
   // Calculate actual prize pool from entry fee × participants
+  // Per-match entry fee (₹).  Mirrors `src/lib/prizes.ts:getEntryFee`.
+  // league 250 / qualifier+eliminator 500 / final 1000.
   function getEntryFee(matchType: string): number {
     const type = (matchType || "league").toLowerCase()
-    if (type === "final") return 500
-    if (type === "eliminator" || type === "qualifier" || type.includes("qualifier") || type.includes("eliminator")) return 350
+    if (type === "final") return 1000
+    if (type === "eliminator" || type === "qualifier" || type.includes("qualifier") || type.includes("eliminator")) return 500
     return 250
   }
   const entryFee = getEntryFee(match.match_type)

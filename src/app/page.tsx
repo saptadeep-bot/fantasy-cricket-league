@@ -5,10 +5,12 @@ import { supabaseAdmin } from "@/lib/supabase"
 
 export const dynamic = "force-dynamic"
 
+// Per-match entry fee (₹).  Mirrors `src/lib/prizes.ts:getEntryFee` —
+// keep these tiers in sync.  league 250 / qualifier+eliminator 500 / final 1000.
 function getEntryFee(matchType: string): number {
   const type = (matchType || "league").toLowerCase()
-  if (type === "final") return 500
-  if (type === "eliminator" || type === "qualifier" || type.includes("qualifier") || type.includes("eliminator")) return 350
+  if (type === "final") return 1000
+  if (type === "eliminator" || type === "qualifier" || type.includes("qualifier") || type.includes("eliminator")) return 500
   return 250
 }
 
