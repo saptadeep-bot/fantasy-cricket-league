@@ -69,9 +69,10 @@ export async function POST(req: NextRequest, { params }: { params: Promise<{ id:
         error: "Could not fetch a full scorecard from any source. Try again in a few minutes.",
       }, { status: 400 })
     }
-    if (scorecard.length < 2) {
+    if (scorecard.length < 2 && !force) {
       return NextResponse.json({
-        error: `Scorecard only has ${scorecard.length} innings (source: ${source}). Both innings must be complete before re-finalizing.`,
+        error: `Scorecard only has ${scorecard.length} innings (source: ${source}). Both innings must be complete before re-finalizing. Use "Force Re-finalize" to bypass if cricapi has stalled and you accept partial data.`,
+        canForce: true,
       }, { status: 400 })
     }
     // Per-innings sanity check — same as finalize (≥3 batters / ≥3 bowlers

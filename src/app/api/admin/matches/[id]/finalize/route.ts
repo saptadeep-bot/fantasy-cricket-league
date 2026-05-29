@@ -68,9 +68,10 @@ export async function POST(req: NextRequest, { params }: { params: Promise<{ id:
         error: "No scorecard data returned from any source (cricapi or EntitySport). Match may not have ended yet, or both APIs are temporarily unavailable. Try again in a minute."
       }, { status: 400 })
     }
-    if (scorecard.length < 2) {
+    if (scorecard.length < 2 && !force) {
       return NextResponse.json({
-        error: `Only ${scorecard.length} innings in scorecard (source: ${source}). Both innings must be complete before finalizing.`
+        error: `Only ${scorecard.length} innings in scorecard (source: ${source}). Both innings must be complete before finalizing. Use "Force Finalize" if you accept that innings 2 contributions will be missing — common when cricapi's data pipeline stalls mid-match (2026-05-29 Q2 incident).`,
+        canForce: true,
       }, { status: 400 })
     }
     // Sanity checks — catch partial-data bugs like the 2026-04-18 incident
@@ -98,9 +99,10 @@ export async function POST(req: NextRequest, { params }: { params: Promise<{ id:
     // total≥15 guard still applies so a truly empty scorecard can't slip
     // through even with force.
     const playerCount = countScorecardPlayers(scorecard as unknown[])
-    if (playerCount < 15) {
+    if (playerCount < 15 && !force) {
       return NextResponse.json({
-        error: `Scorecard looks incomplete — only ${playerCount} batter/bowler entries across both innings (source: ${source}). A full T20 scorecard should have 20+. Wait a minute and try again.`
+        error: `Scorecard looks incomplete — only ${playerCount} batter/bowler entries across both innings (source: ${source}). A full T20 scorecard should have 20+. Wait a minute and try again, or use "Force Finalize" to accept partial data.`,
+        canForce: true,
       }, { status: 400 })
     }
     if (!force) {
