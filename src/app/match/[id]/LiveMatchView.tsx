@@ -163,6 +163,20 @@ export default function LiveMatchView({
   const [liveTeams, setLiveTeams] = useState<Team[]>(initialTeams)
   const [lastUpdated, setLastUpdated] = useState<Date | null>(null)
   const [activeTab, setActiveTab] = useState<"scores" | "myteam" | "allteams">("scores")
+
+  // 2026-05-29: sync state with props on server re-render.  Without this,
+  // any server-driven data refresh (router.refresh, route change, page
+  // revalidation) would update the `players` prop but our React state would
+  // keep showing the initial snapshot from first mount.  That caused the
+  // "Fetch Scores Now succeeds but my screen shows old numbers" symptom.
+  // Auto-poll already updates livePlayers via setLivePlayers; this useEffect
+  // just makes sure any SERVER-side update path also propagates.
+  useEffect(() => {
+    setLivePlayers(players)
+  }, [players])
+  useEffect(() => {
+    setLiveTeams(initialTeams)
+  }, [initialTeams])
   // Tracks which player's breakdown is currently expanded.  Composite key
   // ("teamId:playerId") so the same player on two different friends' teams
   // can be opened independently.  Only meaningful when match is completed.

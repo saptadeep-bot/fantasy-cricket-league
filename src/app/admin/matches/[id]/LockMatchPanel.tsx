@@ -1,5 +1,5 @@
 "use client"
-import { useState } from "react"
+import { useState, useEffect } from "react"
 import { useRouter } from "next/navigation"
 
 interface Player {
@@ -49,6 +49,19 @@ export default function LockMatchPanel({
   const [closing, setClosing] = useState(false)
   const [message, setMessage] = useState<string | null>(null)
   const [squadSaved, setSquadSaved] = useState(existingPlayers.length > 0)
+
+  // 2026-05-29: sync state with prop on every server re-render.  Without
+  // this, `router.refresh()` after Fetch Scores Now refetches `existingPlayers`
+  // from the server but `squadPlayers` state stays at its initial snapshot
+  // forever — admin would see "Updated 16/16" but the visible squad list
+  // showed stale fantasy_points and roles.  Now state tracks prop changes
+  // so a server refresh actually updates what the admin sees.
+  useEffect(() => {
+    setSquadPlayers(existingPlayers)
+    setSelectedXI(new Set(existingPlayers.filter(p => p.is_playing && !p.is_substitute).map(p => p.cricketdata_player_id)))
+    setSubstituteIds(new Set(existingPlayers.filter(p => p.is_substitute).map(p => p.cricketdata_player_id)))
+    setSquadSaved(existingPlayers.length > 0)
+  }, [existingPlayers])
 
   // Manual "Add missing player" form state — safety valve for players that
   // neither cricapi nor EntitySport return (happens for late-named impact
