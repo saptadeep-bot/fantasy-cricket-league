@@ -263,7 +263,12 @@ export default function LiveMatchView({
     }
   }, [match.id])
 
-  // Manual refresh — reads latest from DB instantly (no API call, never fails)
+  // Manual refresh — forces an external API fetch when match is live, then
+  // returns fresh DB data.  Bypasses the 25s server-side cache so the
+  // Refresh button always pulls the latest scorecard (mobile browsers
+  // throttle background polling heavily, so DB could be 10+ min stale and
+  // a DB-only refresh would feel broken).  See scores/route.ts for the
+  // server-side behaviour change on 2026-05-29.
   const manualRefresh = useCallback(async () => {
     setRefreshing(true)
     setRefreshError(null)
@@ -295,7 +300,28 @@ export default function LiveMatchView({
       // N concurrent viewers ≈ 1 external fetch per 25-30s window, same as
       // before.  Quota burn unchanged.
       const interval = setInterval(fetchLiveScores, 30 * 1000)
-      return () => clearInterval(interval)
+
+      // 2026-05-29: tab visibility + focus handlers.  Mobile browsers
+      // throttle setInterval HEAVILY on backgrounded tabs (Chrome/Safari
+      // can drop the rate to ~1/min or worse, especially when screen is
+      // off).  Users come back to the page expecting fresh data but the
+      // poll didn't fire while they were away.  Trigger an immediate
+      // fetch on tab becoming visible OR window regaining focus — covers
+      // both the tab-switch case and the wake-from-lock case.
+      const onVisible = () => {
+        if (document.visibilityState === "visible") {
+          fetchLiveScores()
+        }
+      }
+      const onFocus = () => fetchLiveScores()
+      document.addEventListener("visibilitychange", onVisible)
+      window.addEventListener("focus", onFocus)
+
+      return () => {
+        clearInterval(interval)
+        document.removeEventListener("visibilitychange", onVisible)
+        window.removeEventListener("focus", onFocus)
+      }
     }
   }, [match.status, fetchLiveScores])
 

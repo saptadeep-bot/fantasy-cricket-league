@@ -443,8 +443,12 @@ export async function POST(req: NextRequest, { params }: { params: Promise<{ id:
 }
 
 // ─── Public GET ───────────────────────────────────────────────────────────────
-// ?refresh=1 / ?force=true → instant DB read (participant Refresh button)
-// (no params) → auto-poll: always fetch from API while match is live, return DB data
+// ?refresh=1 / ?force=true → participant Refresh button.  Used to be DB-only,
+//   but on 2026-05-29 we changed it to force an external fetch when match is
+//   live — mobile browsers throttle background tab polling so heavily that the
+//   DB could be 10+ min stale, and users hitting Refresh expected fresh data.
+//   Bypasses the 25s server-side cache.
+// (no params) → auto-poll: respects 25s server-side cache for quota efficiency.
 export async function GET(req: NextRequest, { params }: { params: Promise<{ id: string }> }) {
   const { id } = await params
   const session = await auth()
@@ -455,6 +459,29 @@ export async function GET(req: NextRequest, { params }: { params: Promise<{ id: 
     url.searchParams.get("refresh") === "1" || url.searchParams.get("force") === "true"
 
   if (isParticipantRefresh) {
+    // Force an external fetch when match is live, so the Refresh button
+    // actually pulls fresh data.  Bypasses the 25s cache check used by
+    // auto-poll — user explicitly asked for fresh data by clicking Refresh.
+    const { data: match } = await supabaseAdmin
+      .from("matches")
+      .select("status, cricketdata_match_id")
+      .eq("id", id)
+      .single()
+    if (match?.status === "live" && match?.cricketdata_match_id) {
+      try {
+        await fetchAndSaveScores(id, match.cricketdata_match_id)
+        // Stamp the cache so nearby auto-polls don't immediately duplicate.
+        try {
+          await supabaseAdmin
+            .from("matches")
+            .update({ last_live_fetch_at: new Date().toISOString() })
+            .eq("id", id)
+        } catch { /* column may not exist, ignore */ }
+      } catch {
+        // External fetch failed — return whatever's in the DB anyway, don't
+        // make the user see a blank screen because of a transient API issue.
+      }
+    }
     const [players, teams] = await Promise.all([readPlayersFromDb(id), readTeamsFromDb(id)])
     return NextResponse.json({ players, teams }, { headers: NO_CACHE_HEADERS })
   }
