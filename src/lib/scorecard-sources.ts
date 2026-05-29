@@ -81,8 +81,15 @@ function extractScorecard(data: any): unknown[] | null {
 
 export async function fetchCricapiScorecard(cricketdataMatchId: string): Promise<unknown[] | null> {
   try {
+    // Cache-busting `_t` param defeats any upstream CDN/edge cache on
+    // cricapi's side.  Added 2026-05-29 after observing scorecard data
+    // appearing stuck mid-match — same response coming back over multiple
+    // 30s polls even when actual cricket had progressed.  `cache: "no-store"`
+    // only controls OUR fetch cache; cricapi's own response caching is
+    // upstream of that.  A unique query param per call should force their
+    // cache layer to either skip or revalidate.
     const res = await timedFetch(
-      `https://api.cricapi.com/v1/match_scorecard?apikey=${CRICKETDATA_API_KEY}&id=${cricketdataMatchId}`,
+      `https://api.cricapi.com/v1/match_scorecard?apikey=${CRICKETDATA_API_KEY}&id=${cricketdataMatchId}&_t=${Date.now()}`,
       { cache: "no-store" }
     )
     if (!res) return null
@@ -109,7 +116,7 @@ export interface CricapiMatchInfo {
 export async function fetchCricapiMatchInfo(cricketdataMatchId: string): Promise<CricapiMatchInfo | null> {
   try {
     const res = await timedFetch(
-      `https://api.cricapi.com/v1/match_info?apikey=${CRICKETDATA_API_KEY}&id=${cricketdataMatchId}`,
+      `https://api.cricapi.com/v1/match_info?apikey=${CRICKETDATA_API_KEY}&id=${cricketdataMatchId}&_t=${Date.now()}`,
       { cache: "no-store" }
     )
     if (!res) return null
