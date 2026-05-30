@@ -63,14 +63,22 @@ export async function POST(req: NextRequest, { params }: { params: Promise<{ id:
         .eq("id", id)
     }
 
-    if (!scorecard || scorecard.length === 0) {
+    // When force=1 AND no scorecard is available, fall back to using whatever
+    // fantasy_points are already in match_players (from prior live polling).
+    // This handles the 2026-05-29 Q2 case where cricapi went blank entirely
+    // for ~8 hours post-match, but match_players had partial data from when
+    // cricapi was still responding mid-match.
+    const useStoredOnly = force && (!scorecard || scorecard.length === 0)
+
+    if (!useStoredOnly && (!scorecard || scorecard.length === 0)) {
       return NextResponse.json({
-        error: "No scorecard data returned from any source (cricapi or EntitySport). Match may not have ended yet, or both APIs are temporarily unavailable. Try again in a minute."
+        error: "No scorecard data returned from any source (cricapi or EntitySport). Match may not have ended yet, or both APIs are temporarily unavailable. Try again in a minute, or use \"Force Finalize\" to finalize from currently-stored match_players data.",
+        canForce: true,
       }, { status: 400 })
     }
-    if (scorecard.length < 2 && !force) {
+    if (!useStoredOnly && scorecard!.length < 2 && !force) {
       return NextResponse.json({
-        error: `Only ${scorecard.length} innings in scorecard (source: ${source}). Both innings must be complete before finalizing. Use "Force Finalize" if you accept that innings 2 contributions will be missing — common when cricapi's data pipeline stalls mid-match (2026-05-29 Q2 incident).`,
+        error: `Only ${scorecard!.length} innings in scorecard (source: ${source}). Both innings must be complete before finalizing. Use "Force Finalize" if you accept that innings 2 contributions will be missing — common when cricapi's data pipeline stalls mid-match (2026-05-29 Q2 incident).`,
         canForce: true,
       }, { status: 400 })
     }
@@ -98,16 +106,16 @@ export async function POST(req: NextRequest, { params }: { params: Promise<{ id:
     // ?force=1 admin override skips this per-innings check entirely.  The
     // total≥15 guard still applies so a truly empty scorecard can't slip
     // through even with force.
-    const playerCount = countScorecardPlayers(scorecard as unknown[])
-    if (playerCount < 15 && !force) {
+    const playerCount = useStoredOnly ? 0 : countScorecardPlayers(scorecard as unknown[])
+    if (!useStoredOnly && playerCount < 15 && !force) {
       return NextResponse.json({
         error: `Scorecard looks incomplete — only ${playerCount} batter/bowler entries across both innings (source: ${source}). A full T20 scorecard should have 20+. Wait a minute and try again, or use "Force Finalize" to accept partial data.`,
         canForce: true,
       }, { status: 400 })
     }
-    if (!force) {
+    if (!useStoredOnly && !force) {
       for (let i = 0; i < 2; i++) {
-        const inn = scorecard[i] as { batting?: unknown[]; bowling?: unknown[]; inning?: string }
+        const inn = scorecard![i] as { batting?: unknown[]; bowling?: unknown[]; inning?: string }
         const batN = inn.batting?.length ?? 0
         const bowlN = inn.bowling?.length ?? 0
         if (batN < 3 || bowlN < 3) {
@@ -120,7 +128,11 @@ export async function POST(req: NextRequest, { params }: { params: Promise<{ id:
     }
 
     // Step 2: Compute and save all player fantasy points (uses name-matching + auto-insert for impact subs)
-    await computeAndSave(id, scorecard)
+    // Skip when useStoredOnly — no scorecard to compute from, just use what's
+    // already in match_players from prior live polling.
+    if (!useStoredOnly) {
+      await computeAndSave(id, scorecard!)
+    }
 
     // Step 3: Fetch all submitted teams
     const { data: teams } = await supabaseAdmin
