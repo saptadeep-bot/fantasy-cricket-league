@@ -4,6 +4,14 @@ import Navbar from "@/components/Navbar"
 import { supabaseAdmin } from "@/lib/supabase"
 import ImportMatchesButton from "./ImportMatchesButton"
 
+// 2026-05-30: admin Match Management was showing stale team names after a DB
+// update.  Default Next.js caching held an older render — visible team2 said
+// "TBC" even after SQL UPDATE set team2='Gujarat Titans'.  Force-dynamic on
+// this page so every visit reads fresh from Supabase.  Admin-only page, low
+// traffic, no perf concern.
+export const dynamic = "force-dynamic"
+export const revalidate = 0
+
 export default async function AdminMatchesPage() {
   const session = await auth()
   if (!session) redirect("/login")

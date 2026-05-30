@@ -5,6 +5,13 @@ import Navbar from "@/components/Navbar"
 import LockMatchPanel from "./LockMatchPanel"
 import ScoreControls from "./ScoreControls"
 
+// 2026-05-30: admin pages must always read fresh from Supabase so DB updates
+// (team names, status changes, scoring) reflect immediately.  Default Next.js
+// caching was holding stale renders.  See `/admin/matches/page.tsx` for the
+// original symptom.
+export const dynamic = "force-dynamic"
+export const revalidate = 0
+
 export default async function AdminMatchDetailPage({ params }: { params: Promise<{ id: string }> }) {
   const { id } = await params
   const session = await auth()
